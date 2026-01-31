@@ -13,7 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY analyze.py .
-COPY .env .
 
 # Create output directory for analysis files (will be mounted as volume)
 RUN mkdir -p /app/analysis_outputs
