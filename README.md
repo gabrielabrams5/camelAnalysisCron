@@ -19,8 +19,6 @@ This application connects to a PostgreSQL database to analyze event attendance p
 - **Database updates:**
   - Saves attendance statistics back to the `events` table in the `attendance` column
   - Includes: `total_rsvps`, `total_attendees`, `first_time_attendees`, `conversion_rate`
-  - Updates `referral_count` in the `people` table based on invite token usage
-  - Tracks how many people each person referred using personal outreach tokens
 
 All files are saved to a persistent Railway volume for long-term storage.
 
@@ -185,32 +183,6 @@ RUN echo "0 */6 * * * cd /app && ..." > /etc/cron.d/analytics-cron
 ```
 
 [Cron expression reference](https://crontab.guru/)
-
-## Referral Tracking
-
-The script automatically calculates and updates referral counts for each person based on invite token usage.
-
-### How It Works
-
-1. **Invite Tokens**: Each event attendance record is linked to an invite token that identifies how the person found out about the event
-2. **Personal Outreach**: Only tokens with `category = 'personal outreach'` are counted as referrals
-3. **Name Matching**: The system matches invite token values to people using:
-   - Exact match on `firstname_lastname` or `firstname-lastname` format
-   - Fuzzy matching on first names (80% similarity threshold)
-   - Case-insensitive matching
-
-### Calculation Logic
-
-For each person, the `referral_count` represents:
-- How many **unique people** used their name as an invite token
-- Only counts people who **RSVPed** (includes both attendees and no-shows)
-- **Excludes self-referrals** (person can't refer themselves)
-- **Aggregates across all events** (same token value used multiple times counts all unique people)
-
-### Example
-
-If "logan" appears as an invite token across 6 different events and 31 unique people used those tokens:
-- Logan Goodman's `referral_count` = 30 (excluding Logan himself if he used it)
 
 ## Troubleshooting
 
