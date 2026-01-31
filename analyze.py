@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 import logging
 from datetime import datetime
 import json
+from difflib import SequenceMatcher
 
 def load_data_from_db():
     """Load data from PostgreSQL database instead of CSV files."""
@@ -643,6 +644,147 @@ def save_attendance_to_db(master, events):
     print(f"✅ Attendance data saved to database for {len(events)} events")
     logging.info(f"Successfully updated attendance_data for {len(events)} events")
 
+def update_referral_counts(master):
+    """Update referral_count for each person based on invite token usage."""
+
+    # Load environment variables
+    load_dotenv()
+
+    # Connect to Railway database
+    conn = psycopg2.connect(
+        host=os.getenv('PGHOST'),
+        port=os.getenv('PGPORT'),
+        database=os.getenv('PGDATABASE'),
+        user=os.getenv('PGUSER'),
+        password=os.getenv('PGPASSWORD')
+    )
+
+    cursor = conn.cursor()
+
+    print("\nCalculating referral counts...")
+    logging.info("Updating people.referral_count based on invite token usage...")
+
+    # Get all invite tokens with category='personal outreach'
+    tokens_query = """
+        SELECT id, value, event_id
+        FROM invitetokens
+        WHERE category = 'personal outreach'
+        AND value IS NOT NULL
+        AND value != ''
+    """
+    cursor.execute(tokens_query)
+    invite_tokens = cursor.fetchall()
+
+    # Get all people
+    people_query = """
+        SELECT id, first_name, last_name
+        FROM people
+    """
+    cursor.execute(people_query)
+    people = cursor.fetchall()
+
+    print(f"Processing {len(invite_tokens)} invite tokens and {len(people)} people...")
+
+    # Helper function for fuzzy matching
+    def fuzzy_match(str1, str2, threshold=0.8):
+        """Returns True if strings match with similarity >= threshold"""
+        if not str1 or not str2:
+            return False
+        ratio = SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
+        return ratio >= threshold
+
+    # Calculate referral counts for each person
+    referral_counts = {}
+
+    for person_id, first_name, last_name in people:
+        if not first_name:
+            continue
+
+        # Construct possible name formats
+        first_lower = first_name.lower()
+
+        # Format: firstname_lastname or firstname-lastname
+        possible_full_names = []
+        if last_name:
+            last_lower = last_name.lower()
+            possible_full_names = [
+                f"{first_lower}_{last_lower}",
+                f"{first_lower}-{last_lower}",
+            ]
+
+        # Find matching tokens
+        matching_token_ids = []
+
+        for token_id, token_value, event_id in invite_tokens:
+            if not token_value:
+                continue
+
+            token_lower = token_value.lower()
+
+            # Try exact full name match first
+            if possible_full_names and token_lower in possible_full_names:
+                matching_token_ids.append(token_id)
+                continue
+
+            # Try fuzzy match on first name
+            if fuzzy_match(token_lower, first_lower, threshold=0.8):
+                matching_token_ids.append(token_id)
+
+        # Count unique people who used these tokens (excluding self)
+        if matching_token_ids:
+            placeholders = ','.join(['%s'] * len(matching_token_ids))
+            count_query = f"""
+                SELECT COUNT(DISTINCT person_id)
+                FROM attendance
+                WHERE invite_token_id IN ({placeholders})
+                AND rsvp = TRUE
+                AND person_id != %s
+            """
+            cursor.execute(count_query, matching_token_ids + [person_id])
+            count = cursor.fetchone()[0]
+            referral_counts[person_id] = count
+
+    # Update the database
+    print(f"Updating referral counts for {len(referral_counts)} people...")
+
+    updated_count = 0
+    for person_id, count in referral_counts.items():
+        if count > 0:  # Only update if there are actual referrals
+            update_query = """
+                UPDATE people
+                SET referral_count = %s
+                WHERE id = %s
+            """
+            cursor.execute(update_query, (count, person_id))
+            updated_count += 1
+
+    # Set referral_count to 0 for people with no referrals
+    zero_query = """
+        UPDATE people
+        SET referral_count = 0
+        WHERE referral_count IS NULL
+    """
+    cursor.execute(zero_query)
+
+    conn.commit()
+
+    # Show top referrers before closing connection
+    if referral_counts:
+        top_referrers = sorted(referral_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        print("\nTop 10 Referrers:")
+        for person_id, count in top_referrers:
+            if count > 0:
+                cursor.execute("SELECT first_name, last_name FROM people WHERE id = %s", (person_id,))
+                name_result = cursor.fetchone()
+                if name_result:
+                    print(f"  {name_result[0]} {name_result[1]}: {count} referrals")
+
+    cursor.close()
+    conn.close()
+
+    print(f"\n✅ Referral counts updated: {updated_count} people with referrals, rest set to 0")
+    logging.info(f"Successfully updated referral_count for {updated_count} people")
+
 def generate_summary_stats(master, outdir):
     """Generate overall summary statistics."""
 
@@ -730,6 +872,10 @@ def main():
     # 6. Save attendance data back to database
     print("6. Saving attendance data to database...")
     save_attendance_to_db(master, events)
+
+    # 7. Update referral counts
+    print("7. Updating referral counts...")
+    update_referral_counts(master)
 
     print(f"\n✅ Analysis complete! All outputs saved to: {outdir.resolve()}")
     print("\nGenerated files:")
