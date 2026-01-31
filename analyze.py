@@ -20,6 +20,7 @@ import os
 from dotenv import load_dotenv
 import logging
 from datetime import datetime
+import json
 
 def load_data_from_db():
     """Load data from PostgreSQL database instead of CSV files."""
@@ -583,6 +584,65 @@ def rsvp_conversion_analysis(master, outdir):
 
     return conversion_stats
 
+def save_attendance_to_db(master, events):
+    """Save attendance statistics back to the events table in the database."""
+
+    # Load environment variables
+    load_dotenv()
+
+    # Connect to Railway database
+    conn = psycopg2.connect(
+        host=os.getenv('PGHOST'),
+        port=os.getenv('PGPORT'),
+        database=os.getenv('PGDATABASE'),
+        user=os.getenv('PGUSER'),
+        password=os.getenv('PGPASSWORD')
+    )
+
+    cursor = conn.cursor()
+
+    print("\nSaving attendance data to events table...")
+    logging.info("Updating events table with attendance statistics...")
+
+    # Calculate attendance stats for each event
+    for event_id in events['id'].unique():
+        # Total RSVPs
+        total_rsvps = master[(master['event_id'] == event_id) & (master['rsvp'])]['person_id'].nunique()
+
+        # Total attendees
+        total_attendees = master[(master['event_id'] == event_id) & (master['checked_in'])]['person_id'].nunique()
+
+        # First-time attendees
+        first_time_attendees = master[
+            (master['event_id'] == event_id) &
+            (master['checked_in']) &
+            (master['is_first_attendance'])
+        ]['person_id'].nunique()
+
+        # Create attendance data object
+        attendance_data = {
+            'total_rsvps': total_rsvps,
+            'total_attendees': total_attendees,
+            'first_time_attendees': first_time_attendees,
+            'conversion_rate': round((total_attendees / total_rsvps * 100), 2) if total_rsvps > 0 else 0
+        }
+
+        # Update the events table with attendance data as JSON
+        update_query = """
+            UPDATE events
+            SET attendance = %s
+            WHERE id = %s
+        """
+
+        cursor.execute(update_query, (json.dumps(attendance_data), event_id))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    print(f"✅ Attendance data saved to database for {len(events)} events")
+    logging.info(f"Successfully updated attendance_data for {len(events)} events")
+
 def generate_summary_stats(master, outdir):
     """Generate overall summary statistics."""
 
@@ -666,6 +726,10 @@ def main():
     # 5. Generate summary stats
     print("5. Generating summary statistics...")
     summary_stats = generate_summary_stats(master, outdir)
+
+    # 6. Save attendance data back to database
+    print("6. Saving attendance data to database...")
+    save_attendance_to_db(master, events)
 
     print(f"\n✅ Analysis complete! All outputs saved to: {outdir.resolve()}")
     print("\nGenerated files:")

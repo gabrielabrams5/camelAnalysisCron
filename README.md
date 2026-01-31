@@ -16,6 +16,10 @@ This application connects to a PostgreSQL database to analyze event attendance p
 - **1 CSV data file:**
   - `summary_stats.csv` - Overall summary statistics
 
+- **Database updates:**
+  - Saves attendance statistics back to the `events` table in the `attendance` column
+  - Includes: `total_rsvps`, `total_attendees`, `first_time_attendees`, `conversion_rate`
+
 All files are saved to a persistent Railway volume for long-term storage.
 
 ## Schedule
