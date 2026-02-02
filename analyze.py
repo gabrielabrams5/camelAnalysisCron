@@ -604,6 +604,30 @@ def save_attendance_to_db(master, events):
     print("\nSaving attendance data to events table...")
     logging.info("Updating events table with attendance statistics...")
 
+    # Check if attendance column needs migration from integer to jsonb
+    cursor.execute("""
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_name = 'events'
+        AND column_name = 'attendance'
+    """)
+    result = cursor.fetchone()
+
+    if result and result[0] in ('integer', 'smallint', 'bigint'):
+        print("Migrating attendance column from INTEGER to JSONB...")
+        logging.info("Migrating attendance column from INTEGER to JSONB...")
+        cursor.execute("""
+            ALTER TABLE events
+            ALTER COLUMN attendance TYPE jsonb
+            USING CASE
+                WHEN attendance IS NULL THEN NULL
+                ELSE jsonb_build_object('total_attendees', attendance)
+            END
+        """)
+        conn.commit()
+        print("✅ Migration complete")
+        logging.info("Migration complete")
+
     # Calculate attendance stats for each event
     for event_id in events['id'].unique():
         # Total RSVPs
