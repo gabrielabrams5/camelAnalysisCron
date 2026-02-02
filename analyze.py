@@ -619,12 +619,12 @@ def save_attendance_to_db(master, events):
             (master['is_first_attendance'])
         ]['person_id'].nunique()
 
-        # Create attendance data object
+        # Create attendance data object (convert numpy types to Python types for JSON)
         attendance_data = {
-            'total_rsvps': total_rsvps,
-            'total_attendees': total_attendees,
-            'first_time_attendees': first_time_attendees,
-            'conversion_rate': round((total_attendees / total_rsvps * 100), 2) if total_rsvps > 0 else 0
+            'total_rsvps': int(total_rsvps),
+            'total_attendees': int(total_attendees),
+            'first_time_attendees': int(first_time_attendees),
+            'conversion_rate': float(round((total_attendees / total_rsvps * 100), 2)) if total_rsvps > 0 else 0.0
         }
 
         # Update the events table with attendance data as JSON
