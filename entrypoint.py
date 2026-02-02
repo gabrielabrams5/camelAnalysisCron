@@ -9,6 +9,15 @@ import subprocess
 import time
 from datetime import datetime
 
+# Force unbuffered output
+sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
+
+# Print immediately to confirm Python is running
+print("=" * 50, flush=True)
+print("ENTRYPOINT STARTING - Python is running!", flush=True)
+print("=" * 50, flush=True)
+
 def log(message):
     """Print with timestamp"""
     print(f"[{datetime.now().isoformat()}] {message}", flush=True)
@@ -123,4 +132,12 @@ def main():
         sys.exit(0)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        log("Sleeping for 1 hour to allow debugging...")
+        time.sleep(3600)
+        sys.exit(1)

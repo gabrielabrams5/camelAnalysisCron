@@ -1,8 +1,8 @@
 # Use Python 3.11 slim base image
 FROM python:3.11-slim
 
-# Install cron
-RUN apt-get update && apt-get install -y cron && rm -rf /var/lib/apt/lists/*
+# Install cron and procps (for pgrep)
+RUN apt-get update && apt-get install -y cron procps && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app

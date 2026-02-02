@@ -3,6 +3,5 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "cron && tail -f /var/log/cron.log"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
