@@ -604,29 +604,25 @@ def save_attendance_to_db(master, events):
     print("\nSaving attendance data to events table...")
     logging.info("Updating events table with attendance statistics...")
 
-    # Check if attendance column needs migration from integer to jsonb
+    # Check if attendance_data column exists, create if not
     cursor.execute("""
-        SELECT data_type
+        SELECT column_name
         FROM information_schema.columns
         WHERE table_name = 'events'
-        AND column_name = 'attendance'
+        AND column_name = 'attendance_data'
     """)
     result = cursor.fetchone()
 
-    if result and result[0] in ('integer', 'smallint', 'bigint'):
-        print("Migrating attendance column from INTEGER to JSONB...")
-        logging.info("Migrating attendance column from INTEGER to JSONB...")
+    if not result:
+        print("Creating attendance_data column as JSONB...")
+        logging.info("Creating attendance_data column as JSONB...")
         cursor.execute("""
             ALTER TABLE events
-            ALTER COLUMN attendance TYPE jsonb
-            USING CASE
-                WHEN attendance IS NULL THEN NULL
-                ELSE jsonb_build_object('total_attendees', attendance)
-            END
+            ADD COLUMN attendance_data jsonb
         """)
         conn.commit()
-        print("✅ Migration complete")
-        logging.info("Migration complete")
+        print("✅ Column created successfully")
+        logging.info("Column created successfully")
 
     # Calculate attendance stats for each event
     for event_id in events['id'].unique():
@@ -654,7 +650,7 @@ def save_attendance_to_db(master, events):
         # Update the events table with attendance data as JSON
         update_query = """
             UPDATE events
-            SET attendance = %s::jsonb
+            SET attendance_data = %s::jsonb
             WHERE id = %s
         """
 
