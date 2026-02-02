@@ -17,6 +17,10 @@ COPY analyze.py .
 # Create output directory for analysis files (will be mounted as volume)
 RUN mkdir -p /app/analysis_outputs
 
+# Create a startup script
+COPY startup.sh /app/startup.sh
+RUN chmod +x /app/startup.sh
+
 # Create cron job file
 # Run weekly on Sunday at midnight UTC (0 0 * * 0)
 RUN echo "0 0 * * 0 cd /app && /usr/local/bin/python /app/analyze.py --outdir /app/analysis_outputs >> /var/log/cron.log 2>&1" > /etc/cron.d/analytics-cron
@@ -30,5 +34,5 @@ RUN crontab /etc/cron.d/analytics-cron
 # Create the log file to be able to run tail
 RUN touch /var/log/cron.log
 
-# Run cron in the foreground and tail the log file
-CMD cron && tail -f /var/log/cron.log
+# Run the startup script
+CMD ["/app/startup.sh"]
