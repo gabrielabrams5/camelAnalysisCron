@@ -17,9 +17,9 @@ COPY analyze.py .
 # Create output directory for analysis files (will be mounted as volume)
 RUN mkdir -p /app/analysis_outputs
 
-# Create a startup script
-COPY startup.sh /app/startup.sh
-RUN chmod +x /app/startup.sh
+# Copy entrypoint script
+COPY entrypoint.py /app/entrypoint.py
+RUN chmod +x /app/entrypoint.py
 
 # Create cron job file
 # Run weekly on Sunday at midnight UTC (0 0 * * 0)
@@ -34,5 +34,5 @@ RUN crontab /etc/cron.d/analytics-cron
 # Create the log file to be able to run tail
 RUN touch /var/log/cron.log
 
-# Run the startup script
-CMD ["/app/startup.sh"]
+# Run the entrypoint script
+CMD ["python3", "/app/entrypoint.py"]
