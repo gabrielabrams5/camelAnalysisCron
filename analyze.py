@@ -630,7 +630,7 @@ def save_attendance_to_db(master, events):
         # Update the events table with attendance data as JSON
         update_query = """
             UPDATE events
-            SET attendance = %s
+            SET attendance = %s::jsonb
             WHERE id = %s
         """
 
