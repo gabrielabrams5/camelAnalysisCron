@@ -634,7 +634,7 @@ def save_attendance_to_db(master, events):
             WHERE id = %s
         """
 
-        cursor.execute(update_query, (json.dumps(attendance_data), event_id))
+        cursor.execute(update_query, (json.dumps(attendance_data), int(event_id)))
 
     conn.commit()
     cursor.close()
