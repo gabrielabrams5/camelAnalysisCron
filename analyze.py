@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 import logging
 from datetime import datetime
 import json
+import io
 
 def load_data_from_db():
     """Load data from PostgreSQL database instead of CSV files."""
@@ -141,6 +142,52 @@ def create_master_dataset_from_db():
 
     return master, events
 
+def save_plot_to_db(graph_name):
+    """Save the current matplotlib plot to the database."""
+
+    # Load environment variables
+    load_dotenv()
+
+    # Save to memory buffer
+    buffer = io.BytesIO()
+    plt.savefig(buffer, format='png', dpi=150, bbox_inches='tight')
+    png_data = buffer.getvalue()
+    buffer.close()
+
+    # Connect to database
+    conn = psycopg2.connect(
+        host=os.getenv('PGHOST'),
+        port=os.getenv('PGPORT'),
+        database=os.getenv('PGDATABASE'),
+        user=os.getenv('PGUSER'),
+        password=os.getenv('PGPASSWORD')
+    )
+
+    cursor = conn.cursor()
+
+    # Create table if it doesn't exist
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS analytics_graphs (
+            graph_name TEXT PRIMARY KEY,
+            image_data BYTEA NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )
+    """)
+
+    # Save to database
+    cursor.execute("""
+        INSERT INTO analytics_graphs (graph_name, image_data, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (graph_name)
+        DO UPDATE SET image_data = EXCLUDED.image_data, updated_at = NOW()
+    """, (graph_name, png_data))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    print(f"  ✅ Saved {graph_name} to database")
+
 def retention_analysis(master, events, outdir):
     """Analyze retention by event including RSVPs."""
 
@@ -206,7 +253,7 @@ def retention_analysis(master, events, outdir):
                        f'{int(height)}', ha='center', va='bottom', fontsize=7)
 
     plt.tight_layout()
-    plt.savefig(outdir / 'retention_by_event.png', dpi=150, bbox_inches='tight')
+    save_plot_to_db('retention_by_event.png')
     plt.close()
 
     return retention_df
@@ -290,7 +337,7 @@ def new_members_analysis(master, events, outdir):
                        f'{int(height)}', ha='center', va='bottom', fontsize=6)
 
     plt.tight_layout()
-    plt.savefig(outdir / 'new_members_by_event.png', dpi=150, bbox_inches='tight')
+    save_plot_to_db('new_members_by_event.png')
     plt.close()
 
     # New attendees by category with RSVP tracking
@@ -376,7 +423,7 @@ def new_members_analysis(master, events, outdir):
     ax.legend(loc='upper right', ncol=2)
 
     plt.tight_layout()
-    plt.savefig(outdir / 'new_members_by_category.png', dpi=150, bbox_inches='tight')
+    save_plot_to_db('new_members_by_category.png')
     plt.close()
 
     return new_members_df, category_returns_df
@@ -477,7 +524,7 @@ def party_analysis(master, events, outdir):
                        f'{int(height)}', ha='center', va='bottom', fontsize=8)
 
     plt.tight_layout()
-    plt.savefig(outdir / 'party_funnel.png', dpi=150, bbox_inches='tight')
+    save_plot_to_db('party_funnel.png')
     plt.close()
 
     return party_df
@@ -573,7 +620,7 @@ def rsvp_conversion_analysis(master, outdir):
            bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
 
     plt.tight_layout()
-    plt.savefig(outdir / 'rsvp_conversion.png', dpi=150, bbox_inches='tight')
+    save_plot_to_db('rsvp_conversion.png')
     plt.close()
 
     # Return summary stats for all events
