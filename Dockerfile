@@ -13,6 +13,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY analyze.py .
+COPY luma_sync.py .
+COPY import_luma_attendance.py .
+COPY run_luma_pipeline.sh .
 
 # Create output directory for analysis files (will be mounted as volume)
 RUN mkdir -p /app/analysis_outputs
@@ -21,9 +24,12 @@ RUN mkdir -p /app/analysis_outputs
 COPY entrypoint.py /app/entrypoint.py
 RUN chmod +x /app/entrypoint.py
 
+# Make pipeline script executable
+RUN chmod +x /app/run_luma_pipeline.sh
+
 # Create cron job file
-# Run weekly on Sunday at midnight UTC (0 0 * * 0)
-RUN echo "0 0 * * 0 cd /app && /usr/local/bin/python /app/analyze.py --outdir /app/analysis_outputs >> /var/log/cron.log 2>&1" > /etc/cron.d/analytics-cron
+# Run every 6 hours: 0 */6 * * * (or customize as needed)
+RUN echo "0 */6 * * * cd /app && /bin/bash /app/run_luma_pipeline.sh >> /var/log/cron.log 2>&1" > /etc/cron.d/analytics-cron
 
 # Give execution rights on the cron job
 RUN chmod 0644 /etc/cron.d/analytics-cron

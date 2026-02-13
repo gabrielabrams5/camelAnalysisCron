@@ -24,10 +24,10 @@ def log(message):
 
 def main():
     log("=" * 50)
-    log("Event Analytics Cron Service Starting...")
+    log("Luma Event Sync & Analytics Cron Service Starting...")
     log("=" * 50)
     log(f"Current time: {datetime.now()}")
-    log("Cron schedule: Sundays at midnight UTC (0 0 * * 0)")
+    log("Cron schedule: Every 6 hours (0 */6 * * *)")
     log("")
 
     # Check environment variables
@@ -38,11 +38,12 @@ def main():
         'PGUSER': os.getenv('PGUSER'),
         'PGPASSWORD': os.getenv('PGPASSWORD'),
         'PGPORT': os.getenv('PGPORT'),
+        'LUMA_API_KEY': os.getenv('LUMA_API_KEY'),
     }
 
     missing = []
     for key, value in env_vars.items():
-        if key == 'PGPASSWORD':
+        if key in ['PGPASSWORD', 'LUMA_API_KEY']:
             log(f"  {key}: {'SET' if value else 'NOT_SET'}")
         else:
             log(f"  {key}: {value if value else 'NOT_SET'}")
@@ -93,32 +94,32 @@ def main():
 
     log("")
 
-    # Run initial analysis
+    # Run initial pipeline
     log("=" * 50)
-    log("Running Initial Analysis")
+    log("Running Initial Luma Sync & Analytics Pipeline")
     log("=" * 50)
 
     try:
         result = subprocess.run(
-            ['python', '/app/analyze.py', '--outdir', '/app/analysis_outputs'],
+            ['/bin/bash', '/app/run_luma_pipeline.sh'],
             capture_output=False,  # Show output in real-time
             text=True
         )
 
         log("")
         if result.returncode == 0:
-            log("✅ Initial analysis completed successfully!")
+            log("✅ Initial pipeline run completed successfully!")
         else:
-            log(f"⚠️  Initial analysis failed with exit code: {result.returncode}")
+            log(f"⚠️  Initial pipeline run failed with exit code: {result.returncode}")
             log("Check the output above for errors.")
     except Exception as e:
-        log(f"⚠️  Initial analysis failed with exception: {e}")
+        log(f"⚠️  Initial pipeline run failed with exception: {e}")
 
     log("")
     log("=" * 50)
     log("Service is Running")
     log("=" * 50)
-    log("Scheduled runs: Sundays at midnight UTC")
+    log("Scheduled runs: Every 6 hours")
     log("Volume mount: /app/analysis_outputs")
     log("")
     log("Cron logs will appear below:")

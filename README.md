@@ -1,10 +1,27 @@
-# Event Analytics Cron Job
+# Luma Event Sync & Analytics Cron Service
 
-Automated weekly analytics for event attendance and RSVP data, running on Railway with persistent image storage.
+Automated event synchronization from Luma API, attendance data import, and analytics generation, running on Railway.
 
 ## What This Does
 
-This application connects to a PostgreSQL database to analyze event attendance patterns and generates:
+This application provides a complete pipeline for managing events from Luma:
+
+### 1. **Luma Event Sync** (`luma_sync.py`)
+- Fetches all events from Luma API
+- **Future events**: Creates new events or updates missing metadata in the database
+  - Event name, start datetime, description (speaker bio), signup URL
+- **Past events** (>1 day old): Downloads attendance CSV files for events that haven't been processed yet
+
+### 2. **Attendance Import** (`import_luma_attendance.py`)
+- Processes Luma CSV files with sophisticated person matching:
+  - Matches by email → phone → exact name → fuzzy name matching
+  - Creates new person records if no match found
+  - Updates person fields: gender, school, class year, contact info
+- Creates attendance records with RSVP/approval/check-in status
+- Handles invite token tracking for referral analysis
+
+### 3. **Analytics Generation** (`analyze.py`)
+- Connects to PostgreSQL database to analyze event attendance patterns and generates:
 
 - **5 PNG visualization charts:**
   - `retention_by_event.png` - Event retention analysis
@@ -22,9 +39,30 @@ This application connects to a PostgreSQL database to analyze event attendance p
 
 All files are saved to a persistent Railway volume for long-term storage.
 
+## Pipeline Execution Flow
+
+```
+CRON TRIGGER (every 6 hours)
+  ↓
+luma_sync.py
+  ├─ Fetch all Luma events via API
+  ├─ Future events: CREATE/UPDATE in database
+  ├─ Past events with attendance==0: Download CSV
+  └─ Output: List of CSVs to process
+  ↓
+import_luma_attendance.py (only if CSVs downloaded)
+  ├─ Match/create people (email→phone→name→fuzzy)
+  ├─ Update person data (gender, school, year, contact info)
+  └─ Create attendance records
+  ↓
+analyze.py (always runs)
+  ├─ Generate analytics graphs
+  └─ Save statistics to database
+```
+
 ## Schedule
 
-The cron job runs **weekly on Sunday at midnight UTC (00:00)**.
+The cron job runs **every 6 hours** to keep events synchronized with Luma.
 
 ## Railway Deployment
 
@@ -53,7 +91,10 @@ The cron job runs **weekly on Sunday at midnight UTC (00:00)**.
    PGDATABASE=your-database-name
    PGUSER=your-database-user
    PGPASSWORD=your-database-password
+   LUMA_API_KEY=your-luma-api-key
    ```
+
+   **Note:** Replace `your-luma-api-key` with your actual Luma API key.
 
 4. **Create and mount a Railway volume:**
 
@@ -120,15 +161,23 @@ View logs in Railway's dashboard to monitor cron job execution:
    PGDATABASE=your-database-name
    PGUSER=your-database-user
    PGPASSWORD=your-database-password
+   LUMA_API_KEY=your-luma-api-key
    ```
 
-3. **Run the script:**
+3. **Run the full pipeline:**
    ```bash
-   python analyze.py
+   bash run_luma_pipeline.sh
    ```
 
-   Or specify a custom output directory:
+   Or run individual components:
    ```bash
+   # Sync events from Luma
+   python luma_sync.py
+
+   # Import attendance (requires event CSVs)
+   python import_luma_attendance.py
+
+   # Run analytics only
    python analyze.py --outdir custom_output_folder
    ```
 
@@ -148,38 +197,90 @@ docker run -v $(pwd)/analysis_outputs:/app/analysis_outputs event-analytics
 
 ```
 .
-├── analyze.py           # Main analytics script
-├── requirements.txt     # Python dependencies
-├── Dockerfile          # Container configuration with cron
-├── railway.toml        # Railway deployment config
-├── .env                # Environment variables (not in git)
-├── .gitignore          # Git ignore rules
-└── README.md           # This file
+├── luma_sync.py                 # Luma API event sync script
+├── import_luma_attendance.py    # Attendance CSV import script
+├── analyze.py                   # Analytics generation script
+├── run_luma_pipeline.sh         # Pipeline orchestrator script
+├── entrypoint.py                # Docker entrypoint with cron
+├── requirements.txt             # Python dependencies
+├── Dockerfile                   # Container configuration
+├── railway.toml                 # Railway deployment config
+├── schema.sql                   # Database schema
+├── .env                         # Environment variables (not in git)
+├── .gitignore                   # Git ignore rules
+└── README.md                    # This file
 ```
 
 ## Environment Variables
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `PGHOST` | PostgreSQL host | `yamabiko.proxy.rlwy.net` |
-| `PGPORT` | PostgreSQL port | `58300` |
-| `PGDATABASE` | Database name | `railway` |
-| `PGUSER` | Database user | `postgres` |
-| `PGPASSWORD` | Database password | `your-password-here` |
+| Variable | Description | Example | Required |
+|----------|-------------|---------|----------|
+| `PGHOST` | PostgreSQL host | `yamabiko.proxy.rlwy.net` | Yes |
+| `PGPORT` | PostgreSQL port | `58300` | Yes |
+| `PGDATABASE` | Database name | `railway` | Yes |
+| `PGUSER` | Database user | `postgres` | Yes |
+| `PGPASSWORD` | Database password | `your-password-here` | Yes |
+| `LUMA_API_KEY` | Luma API authentication key | `lu_api_xxx...` | Yes |
+| `LUMA_CALENDAR_ID` | Optional Luma calendar ID filter | `cal-abc123` | No |
+
+## Database Migration
+
+Before deploying, add the new `luma_event_id` column to your events table:
+
+```sql
+-- Connect to your database and run:
+ALTER TABLE events ADD COLUMN luma_event_id VARCHAR(100);
+ALTER TABLE events ADD COLUMN attendance_data JSONB;
+
+-- Optional: Add index for faster lookups
+CREATE INDEX idx_events_luma_id ON events(luma_event_id);
+```
+
+## Luma API Configuration
+
+### Getting Your Luma API Key
+
+1. Log into your Luma account
+2. Navigate to Settings → API or Developer Settings
+3. Generate an API key
+4. Add it to your Railway environment variables as `LUMA_API_KEY`
+
+### Customizing Luma API Endpoints
+
+The Luma API endpoints are configured in `luma_sync.py`. You may need to update:
+
+- `LUMA_API_BASE_URL` - Base URL for Luma API
+- Event listing endpoint
+- CSV download endpoint
+
+Check the [Luma API documentation](https://docs.lu.ma/reference/api-overview) for the latest endpoint information.
+
+### CSV Column Mapping
+
+The `import_luma_attendance.py` script expects specific CSV columns from Luma. If your CSV format differs, update the `COLUMN_MAPPING` dictionary in the script:
+
+```python
+COLUMN_MAPPING = {
+    'first_name': 'First Name',
+    'last_name': 'Last Name',
+    'email': 'Email',
+    # ... add your custom mappings
+}
+```
 
 ## Customizing the Schedule
 
 To change the cron schedule, modify the cron expression in `Dockerfile`:
 
 ```dockerfile
-# Current: Weekly on Sunday at midnight
-RUN echo "0 0 * * 0 cd /app && ..." > /etc/cron.d/analytics-cron
+# Current: Every 6 hours
+RUN echo "0 */6 * * * cd /app && ..." > /etc/cron.d/analytics-cron
 
 # Daily at 2 AM:
 RUN echo "0 2 * * * cd /app && ..." > /etc/cron.d/analytics-cron
 
-# Every 6 hours:
-RUN echo "0 */6 * * * cd /app && ..." > /etc/cron.d/analytics-cron
+# Every 12 hours:
+RUN echo "0 */12 * * * cd /app && ..." > /etc/cron.d/analytics-cron
 ```
 
 [Cron expression reference](https://crontab.guru/)
@@ -192,11 +293,39 @@ RUN echo "0 */6 * * * cd /app && ..." > /etc/cron.d/analytics-cron
 2. Verify environment variables are set correctly
 3. Ensure the volume is properly mounted at `/app/analysis_outputs`
 
+### Luma API connection errors
+
+1. Verify `LUMA_API_KEY` is set correctly in Railway variables
+2. Check that the API key has proper permissions in Luma
+3. Review Luma API rate limits - you may need to adjust sync frequency
+4. Update API endpoints in `luma_sync.py` if Luma has changed their API
+
 ### Database connection errors
 
 1. Verify all `PG*` environment variables are correct
 2. Check that the database is accessible from Railway
 3. Confirm database credentials have proper permissions
+4. Ensure the database migration has been run (luma_event_id column exists)
+
+### Events not syncing from Luma
+
+1. Check Railway logs for API errors
+2. Verify Luma API endpoints are correct in `luma_sync.py`
+3. Ensure event datetime parsing is working (check for timezone issues)
+4. Verify events have the required fields (name, start_at)
+
+### Attendance CSV import errors
+
+1. Check that CSV column names match `COLUMN_MAPPING` in `import_luma_attendance.py`
+2. Verify Luma CSV download endpoint is correct
+3. Check for missing required columns (First Name, Last Name, Email)
+4. Review logs for person matching issues
+
+### Duplicate person records
+
+1. The fuzzy matching threshold may be too low - adjust in `import_luma_attendance.py`
+2. Verify email matching is working (check for typos in CSV)
+3. Consider adding manual cleanup SQL queries for known duplicates
 
 ### Files not persisting
 

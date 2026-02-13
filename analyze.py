@@ -30,70 +30,77 @@ def load_data_from_db():
     load_dotenv()
 
     # Connect to Railway database
-    conn = psycopg2.connect(
-        host=os.getenv('PGHOST'),
-        port=os.getenv('PGPORT'),
-        database=os.getenv('PGDATABASE'),
-        user=os.getenv('PGUSER'),
-        password=os.getenv('PGPASSWORD')
-    )
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('PGHOST'),
+            port=os.getenv('PGPORT'),
+            database=os.getenv('PGDATABASE'),
+            user=os.getenv('PGUSER'),
+            password=os.getenv('PGPASSWORD')
+        )
+    except psycopg2.Error as e:
+        raise ConnectionError(
+            f"Failed to connect to database in load_data_from_db(): {e}\n"
+            f"Please check your DATABASE_URL environment variable and ensure the database is accessible."
+        )
 
     print("Connected to Railway database")
 
-    # Load attendance data
-    print("Loading attendance data...")
-    attendance_query = """
-        SELECT
-            id,
-            person_id,
-            event_id,
-            rsvp,
-            approved,
-            checked_in,
-            rsvp_datetime,
-            is_first_event,
-            invite_token_id
-        FROM attendance
-        ORDER BY rsvp_datetime
-    """
-    attendance = pd.read_sql(attendance_query, conn)
+    try:
+        # Load attendance data
+        print("Loading attendance data...")
+        attendance_query = """
+            SELECT
+                id,
+                person_id,
+                event_id,
+                rsvp,
+                approved,
+                checked_in,
+                rsvp_datetime,
+                is_first_event,
+                invite_token_id
+            FROM attendance
+            ORDER BY rsvp_datetime
+        """
+        attendance = pd.read_sql(attendance_query, conn)
 
-    # Load events data
-    print("Loading events data...")
-    events_query = """
-        SELECT
-            id,
-            event_name,
-            category,
-            location,
-            start_datetime,
-            description
-        FROM events
-        ORDER BY start_datetime
-    """
-    events = pd.read_sql(events_query, conn)
+        # Load events data
+        print("Loading events data...")
+        events_query = """
+            SELECT
+                id,
+                event_name,
+                category,
+                location,
+                start_datetime,
+                description
+            FROM events
+            ORDER BY start_datetime
+        """
+        events = pd.read_sql(events_query, conn)
 
-    # Load people data
-    print("Loading people data...")
-    people_query = """
-        SELECT
-            id,
-            first_name,
-            last_name,
-            preferred_name,
-            gender,
-            class_year,
-            is_jewish,
-            school,
-            additional_info
-        FROM people
-    """
-    people = pd.read_sql(people_query, conn)
+        # Load people data
+        print("Loading people data...")
+        people_query = """
+            SELECT
+                id,
+                first_name,
+                last_name,
+                preferred_name,
+                gender,
+                class_year,
+                is_jewish,
+                school,
+                additional_info
+            FROM people
+        """
+        people = pd.read_sql(people_query, conn)
 
-    conn.close()
-    print("Database connection closed")
-
-    return attendance, events, people
+        return attendance, events, people
+    finally:
+        conn.close()
+        print("Database connection closed")
 
 def create_master_dataset_from_db():
     """Load data from database and merge into a single master dataset."""
@@ -155,38 +162,46 @@ def save_plot_to_db(graph_name):
     buffer.close()
 
     # Connect to database
-    conn = psycopg2.connect(
-        host=os.getenv('PGHOST'),
-        port=os.getenv('PGPORT'),
-        database=os.getenv('PGDATABASE'),
-        user=os.getenv('PGUSER'),
-        password=os.getenv('PGPASSWORD')
-    )
-
-    cursor = conn.cursor()
-
-    # Create table if it doesn't exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS analytics_graphs (
-            graph_name TEXT PRIMARY KEY,
-            image_data BYTEA NOT NULL,
-            updated_at TIMESTAMP NOT NULL
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('PGHOST'),
+            port=os.getenv('PGPORT'),
+            database=os.getenv('PGDATABASE'),
+            user=os.getenv('PGUSER'),
+            password=os.getenv('PGPASSWORD')
         )
-    """)
+    except psycopg2.Error as e:
+        raise ConnectionError(
+            f"Failed to connect to database in save_plot_to_db(): {e}\n"
+            f"Please check your DATABASE_URL environment variable and ensure the database is accessible."
+        )
 
-    # Save to database
-    cursor.execute("""
-        INSERT INTO analytics_graphs (graph_name, image_data, updated_at)
-        VALUES (%s, %s, NOW())
-        ON CONFLICT (graph_name)
-        DO UPDATE SET image_data = EXCLUDED.image_data, updated_at = NOW()
-    """, (graph_name, png_data))
+    try:
+        cursor = conn.cursor()
 
-    conn.commit()
-    cursor.close()
-    conn.close()
+        # Create table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS analytics_graphs (
+                graph_name TEXT PRIMARY KEY,
+                image_data BYTEA NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            )
+        """)
 
-    print(f"  ✅ Saved {graph_name} to database")
+        # Save to database
+        cursor.execute("""
+            INSERT INTO analytics_graphs (graph_name, image_data, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (graph_name)
+            DO UPDATE SET image_data = EXCLUDED.image_data, updated_at = NOW()
+        """, (graph_name, png_data))
+
+        conn.commit()
+        cursor.close()
+
+        print(f"  ✅ Saved {graph_name} to database")
+    finally:
+        conn.close()
 
 def retention_analysis(master, events, outdir):
     """Analyze retention by event including RSVPs."""
@@ -197,8 +212,15 @@ def retention_analysis(master, events, outdir):
     for event_id in events['id'].unique():
         event_rsvps = master[(master['event_id'] == event_id) & (master['rsvp'])]['person_id'].unique()
         event_attendees = master[(master['event_id'] == event_id) & (master['checked_in'])]['person_id'].unique()
-        event_time = events[events['id'] == event_id]['start_datetime'].iloc[0]
-        event_name = events[events['id'] == event_id]['event_name'].iloc[0]
+
+        # Get event info with bounds checking
+        event_info = events[events['id'] == event_id]
+        if event_info.empty:
+            logging.warning(f"retention_analysis: Event ID {event_id} not found in events table, skipping")
+            continue
+
+        event_time = event_info['start_datetime'].iloc[0]
+        event_name = event_info['event_name'].iloc[0]
 
         # Count who returned to ANY later event (attendees)
         later_attendances = master[
@@ -280,7 +302,14 @@ def new_members_analysis(master, events, outdir):
     first_rsvp_returns = []
     for _, row in first_rsvp_no_attend.iterrows():
         event_id = row['event_id']
-        event_time = events[events['id'] == event_id]['start_datetime'].iloc[0]
+
+        # Get event time with bounds checking
+        event_time_df = events[events['id'] == event_id]
+        if event_time_df.empty:
+            logging.warning(f"new_members_analysis: Event ID {event_id} not found in events table, skipping")
+            continue
+
+        event_time = event_time_df['start_datetime'].iloc[0]
         people = row['first_rsvp_people']
 
         returned_later = master[
@@ -360,10 +389,17 @@ def new_members_analysis(master, events, outdir):
         # Count returns for attendees
         attendee_returns = []
         for person in cat_first_timers:
-            first_time = master[
+            # Get first attendance time with bounds checking
+            first_time_df = master[
                 (master['person_id'] == person) &
                 (master['is_first_attendance'])
-            ]['start_datetime'].iloc[0]
+            ]['start_datetime']
+
+            if first_time_df.empty:
+                logging.warning(f"new_members_analysis: Person ID {person} has no first attendance record, skipping")
+                continue
+
+            first_time = first_time_df.iloc[0]
 
             returns = master[
                 (master['person_id'] == person) &
@@ -376,10 +412,17 @@ def new_members_analysis(master, events, outdir):
         # Count if RSVPers ever attended later
         rsvp_returned_count = 0
         for person in cat_first_rsvp:
-            first_rsvp_time = master[
+            # Get first RSVP time with bounds checking
+            first_rsvp_time_df = master[
                 (master['person_id'] == person) &
                 (master['is_first_rsvp'])
-            ]['start_datetime'].iloc[0]
+            ]['start_datetime']
+
+            if first_rsvp_time_df.empty:
+                logging.warning(f"new_members_analysis: Person ID {person} has no first RSVP record, skipping")
+                continue
+
+            first_rsvp_time = first_rsvp_time_df.iloc[0]
 
             later_attended = master[
                 (master['person_id'] == person) &
@@ -431,20 +474,18 @@ def new_members_analysis(master, events, outdir):
 def party_analysis(master, events, outdir):
     """Analyze the big parties specifically, including first-time RSVP patterns."""
 
-    # Identify parties (case-insensitive matching)
-    party_names = ['launch', 'sababa nights', 'bsmnt', 'fall 2025']
-    party_events = []
-
-    for _, event in events.iterrows():
-        event_name_lower = str(event['event_name']).lower()
-        for party_name in party_names:
-            if party_name in event_name_lower:
-                party_events.append(event['id'])
-                break
+    # Identify parties from database (category = 'party')
+    party_events = events[events['category'] == 'party']['id'].tolist()
 
     party_data = []
     for event_id in party_events:
-        event_info = events[events['id'] == event_id].iloc[0]
+        # Get event info with bounds checking
+        event_info_df = events[events['id'] == event_id]
+        if event_info_df.empty:
+            logging.warning(f"party_analysis: Event ID {event_id} not found in events table, skipping")
+            continue
+
+        event_info = event_info_df.iloc[0]
         event_time = event_info['start_datetime']
 
         # Total RSVPs
@@ -638,77 +679,88 @@ def save_attendance_to_db(master, events):
     load_dotenv()
 
     # Connect to Railway database
-    conn = psycopg2.connect(
-        host=os.getenv('PGHOST'),
-        port=os.getenv('PGPORT'),
-        database=os.getenv('PGDATABASE'),
-        user=os.getenv('PGUSER'),
-        password=os.getenv('PGPASSWORD')
-    )
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('PGHOST'),
+            port=os.getenv('PGPORT'),
+            database=os.getenv('PGDATABASE'),
+            user=os.getenv('PGUSER'),
+            password=os.getenv('PGPASSWORD')
+        )
+    except psycopg2.Error as e:
+        raise ConnectionError(
+            f"Failed to connect to database in save_attendance_to_db(): {e}\n"
+            f"Please check your DATABASE_URL environment variable and ensure the database is accessible."
+        )
 
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    print("\nSaving attendance data to events table...")
-    logging.info("Updating events table with attendance statistics...")
+        print("\nSaving attendance data to events table...")
+        logging.info("Updating events table with attendance statistics...")
 
-    # Check if attendance_data column exists, create if not
-    cursor.execute("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name = 'events'
-        AND column_name = 'attendance_data'
-    """)
-    result = cursor.fetchone()
-
-    if not result:
-        print("Creating attendance_data column as JSONB...")
-        logging.info("Creating attendance_data column as JSONB...")
+        # Check if attendance_data column exists, create if not
         cursor.execute("""
-            ALTER TABLE events
-            ADD COLUMN attendance_data jsonb
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'events'
+            AND column_name = 'attendance_data'
         """)
+        result = cursor.fetchone()
+
+        if not result:
+            print("Creating attendance_data column as JSONB...")
+            logging.info("Creating attendance_data column as JSONB...")
+            cursor.execute("""
+                ALTER TABLE events
+                ADD COLUMN attendance_data jsonb
+            """)
+            conn.commit()
+            print("✅ Column created successfully")
+            logging.info("Column created successfully")
+
+        # Calculate attendance stats for each event
+        for event_id in events['id'].unique():
+            try:
+                # Total RSVPs
+                total_rsvps = master[(master['event_id'] == event_id) & (master['rsvp'])]['person_id'].nunique()
+
+                # Total attendees
+                total_attendees = master[(master['event_id'] == event_id) & (master['checked_in'])]['person_id'].nunique()
+
+                # First-time attendees
+                first_time_attendees = master[
+                    (master['event_id'] == event_id) &
+                    (master['checked_in']) &
+                    (master['is_first_attendance'])
+                ]['person_id'].nunique()
+
+                # Create attendance data object (convert numpy types to Python types for JSON)
+                attendance_data = {
+                    'total_rsvps': int(total_rsvps),
+                    'total_attendees': int(total_attendees),
+                    'first_time_attendees': int(first_time_attendees),
+                    'conversion_rate': float(round((total_attendees / total_rsvps * 100), 2)) if total_rsvps > 0 else 0.0
+                }
+
+                # Update the events table with attendance data as JSON
+                update_query = """
+                    UPDATE events
+                    SET attendance_data = %s::jsonb
+                    WHERE id = %s
+                """
+
+                cursor.execute(update_query, (json.dumps(attendance_data), int(event_id)))
+            except Exception as e:
+                logging.warning(f"save_attendance_to_db: Failed to process event ID {event_id}: {e}")
+
         conn.commit()
-        print("✅ Column created successfully")
-        logging.info("Column created successfully")
+        cursor.close()
 
-    # Calculate attendance stats for each event
-    for event_id in events['id'].unique():
-        # Total RSVPs
-        total_rsvps = master[(master['event_id'] == event_id) & (master['rsvp'])]['person_id'].nunique()
-
-        # Total attendees
-        total_attendees = master[(master['event_id'] == event_id) & (master['checked_in'])]['person_id'].nunique()
-
-        # First-time attendees
-        first_time_attendees = master[
-            (master['event_id'] == event_id) &
-            (master['checked_in']) &
-            (master['is_first_attendance'])
-        ]['person_id'].nunique()
-
-        # Create attendance data object (convert numpy types to Python types for JSON)
-        attendance_data = {
-            'total_rsvps': int(total_rsvps),
-            'total_attendees': int(total_attendees),
-            'first_time_attendees': int(first_time_attendees),
-            'conversion_rate': float(round((total_attendees / total_rsvps * 100), 2)) if total_rsvps > 0 else 0.0
-        }
-
-        # Update the events table with attendance data as JSON
-        update_query = """
-            UPDATE events
-            SET attendance_data = %s::jsonb
-            WHERE id = %s
-        """
-
-        cursor.execute(update_query, (json.dumps(attendance_data), int(event_id)))
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    print(f"✅ Attendance data saved to database for {len(events)} events")
-    logging.info(f"Successfully updated attendance_data for {len(events)} events")
+        print(f"✅ Attendance data saved to database for {len(events)} events")
+        logging.info(f"Successfully updated attendance_data for {len(events)} events")
+    finally:
+        conn.close()
 
 def generate_summary_stats(master, outdir):
     """Generate overall summary statistics."""
