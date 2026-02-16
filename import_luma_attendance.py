@@ -9,8 +9,10 @@ import os
 import sys
 import json
 import logging
+import argparse
 import pandas as pd
 import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
@@ -52,6 +54,9 @@ COLUMN_MAPPING = {
 # Fuzzy matching threshold
 FUZZY_MATCH_THRESHOLD = 0.80
 
+# Connection refresh interval (refresh every N rows to prevent timeout)
+CONNECTION_REFRESH_INTERVAL = 50
+
 
 def get_db_connection():
     """Create and return a database connection"""
@@ -63,8 +68,57 @@ def get_db_connection():
         sys.exit(1)
 
 
-def safe_get_column(df, column_name, default=''):
-    """Safely get column from dataframe, return default if doesn't exist"""
+def ensure_connection(conn, force_refresh=False):
+    """
+    Test and refresh connection if needed. Returns valid connection.
+
+    Args:
+        conn: Current database connection
+        force_refresh: If True, force a connection refresh
+
+    Returns:
+        Valid database connection
+    """
+    if force_refresh:
+        logging.info("🔄 Refreshing connection...")
+        try:
+            # Commit any pending work before closing
+            conn.commit()
+            conn.close()
+        except (psycopg2.Error, Exception) as e:
+            # Connection already closed or in bad state
+            pass
+        new_conn = get_db_connection()
+        logging.info("✓ Connection refreshed successfully")
+        return new_conn
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
+        return conn
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        logging.warning("⚠️  Connection lost, reconnecting...")
+        try:
+            conn.close()
+        except (psycopg2.Error, Exception) as e:
+            # Connection already closed
+            pass
+        return get_db_connection()
+
+
+def safe_get_column(df, column_name, default=pd.NA):
+    """
+    Safely get column from dataframe, return default if doesn't exist.
+
+    Args:
+        df: DataFrame to get column from
+        column_name: Name of column to retrieve
+        default: Default value if column doesn't exist (default: pd.NA)
+
+    Returns:
+        Series with column data or default values
+    """
     if column_name in df.columns:
         return df[column_name]
     return pd.Series([default] * len(df))
@@ -163,6 +217,227 @@ def normalize_class_year(year_str):
         return current_year + 1
 
     return None
+
+
+def update_event_attendance_count(conn, event_id):
+    """
+    Update the attendance count for an event in the events table.
+
+    Counts all attendance records where checked_in = TRUE for the given event
+    and updates the events.attendance field with this count.
+
+    Args:
+        conn: Database connection
+        event_id: ID of the event to update
+
+    Returns:
+        count: Number of checked-in attendees
+    """
+    cursor = conn.cursor()
+    try:
+        # Count checked-in attendees
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM attendance
+            WHERE event_id = %s AND checked_in = TRUE
+        """, (event_id,))
+
+        count = cursor.fetchone()[0]
+
+        # Update events table
+        cursor.execute("""
+            UPDATE events
+            SET attendance = %s
+            WHERE id = %s
+        """, (count, event_id))
+
+        conn.commit()
+        return count
+    finally:
+        cursor.close()
+
+
+def update_person_attendance_counts(conn, event_id):
+    """
+    Update event_attendance_count for all people who attended a specific event.
+
+    For each person who has an attendance record for the given event,
+    recalculates their total checked-in attendance count and updates
+    the people.event_attendance_count field.
+
+    Args:
+        conn: Database connection
+        event_id: ID of the event whose attendees should be updated
+
+    Returns:
+        count: Number of people records updated
+    """
+    cursor = conn.cursor()
+    try:
+        # Update event_attendance_count for all people who have an attendance
+        # record for this event (whether checked in or not, to handle updates)
+        cursor.execute("""
+            UPDATE people
+            SET event_attendance_count = (
+                SELECT COUNT(*)
+                FROM attendance
+                WHERE person_id = people.id
+                  AND checked_in = TRUE
+            )
+            WHERE id IN (
+                SELECT DISTINCT person_id
+                FROM attendance
+                WHERE event_id = %s
+            )
+        """, (event_id,))
+
+        rows_updated = cursor.rowcount
+        conn.commit()
+
+        logging.info(f"Updated event_attendance_count for {rows_updated} people")
+        return rows_updated
+    finally:
+        cursor.close()
+
+
+def update_names_if_substring(conn, person_id, sheet_first, sheet_last, input_first, input_last):
+    """
+    Update person's name in database to the longer/more complete version.
+
+    If one name is a substring of another (e.g., "Ben" vs "Benjamin"), this function
+    updates the database to use the longer, more complete version. This helps maintain
+    data quality by preferring full names over nicknames or abbreviated versions.
+
+    Args:
+        conn: Database connection
+        person_id: ID of the person to update
+        sheet_first: First name from database
+        sheet_last: Last name from database
+        input_first: First name from current input
+        input_last: Last name from current input
+
+    Returns:
+        None
+    """
+    if pd.isna(sheet_first) or not sheet_first:
+        sheet_first = ""
+    if pd.isna(input_first) or not input_first:
+        input_first = ""
+
+    updates = {}
+
+    if sheet_first.lower() in input_first.lower() or input_first.lower() in sheet_first.lower():
+        longer_first = max(sheet_first, input_first, key=len)
+        updates['first_name'] = longer_first
+
+    if pd.notna(sheet_last) and pd.notna(input_last):
+        if sheet_last.lower() in input_last.lower() or input_last.lower() in sheet_last.lower():
+            longer_last = max(sheet_last, input_last, key=len)
+            updates['last_name'] = longer_last
+
+    if updates:
+        cursor = conn.cursor()
+        try:
+            # Use explicit column names for security instead of dynamic SQL
+            set_parts = []
+            values = []
+            for key, value in updates.items():
+                if key in ['first_name', 'last_name']:  # Whitelist allowed columns
+                    set_parts.append(f"{key} = %s")
+                    values.append(value)
+
+            if set_parts:
+                set_clause = ', '.join(set_parts)
+                values.append(person_id)
+                cursor.execute(f"UPDATE people SET {set_clause} WHERE id = %s", values)
+                conn.commit()
+        finally:
+            cursor.close()
+
+
+def fuzzy_ratio(str_a, str_b):
+    """Calculate fuzzy string similarity ratio using SequenceMatcher"""
+    return SequenceMatcher(None, str_a, str_b).ratio()
+
+
+def match_tracking_link_to_person(conn, link_value, fuzzy_threshold=0.8):
+    """
+    Match a tracking link value to a person in the database using fuzzy matching.
+
+    Args:
+        conn: Database connection
+        link_value: The tracking link string (e.g., "doron", "[name]", "admlzr")
+        fuzzy_threshold: Fuzzy matching threshold (default 0.8)
+
+    Returns:
+        person_id if match found, else None
+    """
+    if not link_value or pd.isna(link_value):
+        return None
+
+    # Clean the link value
+    link_value = str(link_value).strip().lower()
+
+    # Skip generic tracking codes that don't represent personal referrals
+    generic_codes = {
+        'default', 'emailreferral', 'email_first_button',
+        'email_second_button', 'email', 'txt', 'insta',
+        'maillist', 'lastname', '[name]'
+    }
+    if link_value in generic_codes:
+        return None
+
+    # Determine if this is a single word (no underscores or hyphens)
+    is_single_word = '_' not in link_value and '-' not in link_value
+
+    # Try to extract a name from the link value
+    # Remove common prefixes/suffixes
+    clean_name = link_value.replace('_', ' ').replace('-', ' ').strip()
+
+    # Get all people from database
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT id, first_name, last_name FROM people")
+        all_people = cursor.fetchall()
+    finally:
+        cursor.close()
+
+    # Try exact match on first name (and last name only if multi-word)
+    for person in all_people:
+        first = person['first_name'].lower() if person['first_name'] else ''
+        last = person['last_name'].lower() if person['last_name'] else ''
+
+        # Always check first name
+        if clean_name == first:
+            return person['id']
+
+        # Only check last name if this is a multi-word tracking link
+        if not is_single_word and clean_name == last:
+            return person['id']
+
+    # Try fuzzy matching on first name (and last name only if multi-word)
+    best_match = None
+    best_ratio = 0
+
+    for person in all_people:
+        first = person['first_name'].lower() if person['first_name'] else ''
+        last = person['last_name'].lower() if person['last_name'] else ''
+
+        # Check fuzzy match against first name
+        if first:
+            ratio = fuzzy_ratio(clean_name, first)
+            if ratio >= fuzzy_threshold and ratio > best_ratio:
+                best_ratio = ratio
+                best_match = person['id']
+
+        # Check fuzzy match against last name only if multi-word
+        if not is_single_word and last:
+            ratio = fuzzy_ratio(clean_name, last)
+            if ratio >= fuzzy_threshold and ratio > best_ratio:
+                best_ratio = ratio
+                best_match = person['id']
+
+    return best_match
 
 
 def find_person_by_email(cursor, email):
@@ -301,11 +576,28 @@ def update_contact_info(cursor, person_id, row_data):
     Update person's contact information using COALESCE pattern
     Only updates fields that are currently NULL
     From raw_csv_to_sql.py logic
+
+    Returns:
+        bool: True if any contact info was updated, False otherwise
     """
     school_email = row_data.get('school_email')
     personal_email = row_data.get('personal_email')
     phone = row_data.get('phone')
 
+    # Check current values before update
+    cursor.execute("""
+        SELECT school_email, personal_email, phone_number
+        FROM people
+        WHERE id = %s
+    """, (person_id,))
+    current = cursor.fetchone()
+
+    if not current:
+        return False
+
+    current_school_email, current_personal_email, current_phone = current
+
+    # Update contact info
     cursor.execute("""
         UPDATE people
         SET
@@ -315,12 +607,28 @@ def update_contact_info(cursor, person_id, row_data):
         WHERE id = %s
     """, (school_email, personal_email, phone, person_id))
 
+    # Check if any field was updated (was NULL and now has a value)
+    updated = False
+    if current_school_email is None and school_email is not None:
+        updated = True
+    if current_personal_email is None and personal_email is not None:
+        updated = True
+    if current_phone is None and phone is not None:
+        updated = True
 
-def find_or_create_person(cursor, row):
+    return updated
+
+
+def find_or_create_person(conn, cursor, row):
     """
     Find existing person or create new one
     Multi-strategy matching: email -> phone -> exact name -> fuzzy name -> create
     From raw_csv_to_sql.py logic
+
+    Args:
+        conn: Database connection (needed for update_names_if_substring)
+        cursor: Database cursor
+        row: Row data from CSV
     """
     # Extract data from row
     first_name = na_to_none(row.get(COLUMN_MAPPING['first_name']))
@@ -369,6 +677,7 @@ def find_or_create_person(cursor, row):
 
     # Try matching strategies in order
     person_id = None
+    was_created = False
 
     # 1. Try email match (prioritize school email)
     if school_email_final:
@@ -391,11 +700,23 @@ def find_or_create_person(cursor, row):
     # 5. Create new person if no match
     if not person_id:
         person_id = create_person(cursor, row_data)
+        was_created = True
 
     # Update contact info regardless (COALESCE will preserve existing)
-    update_contact_info(cursor, person_id, row_data)
+    contact_updated = update_contact_info(cursor, person_id, row_data)
 
-    return person_id
+    # Update names if substring (only for existing persons, not newly created)
+    if not was_created and person_id and first_name and last_name:
+        # Fetch existing person's name from database
+        cursor.execute("""
+            SELECT first_name, last_name FROM people WHERE id = %s
+        """, (person_id,))
+        result = cursor.fetchone()
+        if result:
+            db_first_name, db_last_name = result
+            update_names_if_substring(conn, person_id, db_first_name, db_last_name, first_name, last_name)
+
+    return person_id, was_created, contact_updated
 
 
 def find_or_create_invite_token(cursor, event_id, tracking_link):
@@ -441,6 +762,9 @@ def create_attendance_record(cursor, person_id, event_id, row):
     """
     Create attendance record for person at event
     From raw_csv_to_sql.py logic
+
+    Returns:
+        tuple: (tracking_link, checked_in) for referral tracking
     """
     # Parse attendance fields
     approved_status = na_to_none(row.get(COLUMN_MAPPING['approved']))
@@ -520,14 +844,17 @@ def create_attendance_record(cursor, person_id, event_id, row):
                 WHERE person_id = %s AND event_id != %s
             """, (person_id, earliest_event_id))
 
+    return tracking_link, checked_in
 
-def process_event_csv(event_id, csv_path, event_name):
+
+def process_event_csv(event_id, csv_path, event_name, log_people=False):
     """
     Process a single event CSV file
     Args:
         event_id: Database event ID
         csv_path: Path to CSV file
         event_name: Name of event for logging
+        log_people: If True, print person information as each row is processed
     """
     logging.info(f"Processing CSV for event: {event_name} (ID: {event_id})")
 
@@ -539,37 +866,125 @@ def process_event_csv(event_id, csv_path, event_name):
         df = pd.read_csv(csv_path)
         logging.info(f"Read {len(df)} rows from CSV")
 
+        # Detect referral column if it exists
+        referral_column = None
+        possible_referral_columns = [
+            'How did you hear about this event?',
+            'Who referred you?',
+            'Referral',
+            'Referred by'
+        ]
+        for col in possible_referral_columns:
+            if col in df.columns:
+                referral_column = col
+                logging.info(f"Detected referral column: {referral_column}")
+                break
+
         # Process each row
         attendance_count = 0
+        processed_count = 0
+        new_people_count = 0
+        new_contacts_count = 0
         for idx, row in df.iterrows():
             # Find or create person
-            person_id = find_or_create_person(cursor, row)
+            person_id, was_created, contact_updated = find_or_create_person(conn, cursor, row)
+            if was_created:
+                new_people_count += 1
+            if contact_updated:
+                new_contacts_count += 1
 
             # Create attendance record
-            create_attendance_record(cursor, person_id, event_id, row)
+            tracking_link, checked_in = create_attendance_record(cursor, person_id, event_id, row)
             attendance_count += 1
 
-            # Commit periodically to prevent connection timeout
-            if (idx + 1) % 50 == 0:
+            # Log person information if logging is enabled
+            if log_people and person_id:
+                # Get person info with email
+                log_cursor = conn.cursor(cursor_factory=RealDictCursor)
+                try:
+                    log_cursor.execute("""
+                        SELECT
+                            first_name,
+                            last_name,
+                            COALESCE(school_email, personal_email) as email
+                        FROM people
+                        WHERE id = %s
+                    """, (person_id,))
+                    person_info = log_cursor.fetchone()
+                finally:
+                    log_cursor.close()
+
+                # Determine referral code from invite token or referral column
+                referral_code = "N/A"
+                if tracking_link and not pd.isna(tracking_link) and str(tracking_link).lower() not in ['default', 'email', 'txt', 'insta', 'maillist']:
+                    referral_code = str(tracking_link)
+                elif referral_column and referral_column in row.index and not pd.isna(row[referral_column]):
+                    referral_code = str(row[referral_column])
+
+                # Attendance status
+                attendance_status = "✓ Attended" if checked_in else "✗ No-show"
+
+                if person_info:
+                    logging.info(f"  📋 {person_info['first_name']} {person_info['last_name']} | {person_info['email'] or 'No email'} | {attendance_status} | Referral: {referral_code}")
+
+            # Increment referral count if this person checked in and was referred
+            if checked_in:
+                referrer_id = None
+
+                # 1. Check tracking link for referral
+                if tracking_link and not pd.isna(tracking_link):
+                    referrer_id = match_tracking_link_to_person(conn, tracking_link)
+                    if referrer_id:
+                        logging.info(f"  → Tracking link '{tracking_link}' matched to person ID {referrer_id}")
+
+                # 2. Check referral column if it exists
+                if referral_column and referral_column in row.index and not pd.isna(row[referral_column]):
+                    referrer_name = str(row[referral_column]).strip()
+                    # Try to match the referrer name to a person
+                    # Use fuzzy matching on the referrer name
+                    referrer_matches = fuzzy_match_name(cursor, referrer_name, "")
+                    if referrer_matches:
+                        referrer_id = referrer_matches
+                        logging.info(f"  → Referral column '{referrer_name}' matched to person ID {referrer_id}")
+
+                # Increment referral count
+                if referrer_id and referrer_id != person_id:  # Don't count self-referrals
+                    cursor.execute("""
+                        UPDATE people
+                        SET referral_count = referral_count + 1
+                        WHERE id = %s
+                    """, (referrer_id,))
+                    logging.info(f"  ✓ Incremented referral_count for person ID {referrer_id}")
+
+            processed_count += 1
+
+            # Refresh connection periodically to prevent timeouts
+            if processed_count % CONNECTION_REFRESH_INTERVAL == 0:
+                logging.info(f"\n--- Processed {processed_count} rows, refreshing connection ---")
+                conn = ensure_connection(conn, force_refresh=True)
+                cursor.close()
+                cursor = conn.cursor()
+            elif processed_count % 10 == 0:
                 conn.commit()
-                logging.info(f"Processed {idx + 1}/{len(df)} rows")
+                logging.info(f"Processed {processed_count}/{len(df)} rows...")
 
         # Final commit
         conn.commit()
 
-        # Update event attendance count
-        cursor.execute("""
-            UPDATE events
-            SET attendance = (
-                SELECT COUNT(*) FROM attendance
-                WHERE event_id = %s AND checked_in = TRUE
-            )
-            WHERE id = %s
-        """, (event_id, event_id))
+        # Update event attendance count using the new function
+        final_attendance_count = update_event_attendance_count(conn, event_id)
 
-        conn.commit()
+        # Update person attendance counts for all people who attended this event
+        people_updated = update_person_attendance_counts(conn, event_id)
 
-        logging.info(f"Successfully processed {attendance_count} attendees for event {event_name}")
+        # Print enhanced statistics
+        logging.info(f"\n=== Import Complete for {event_name} ===")
+        logging.info(f"Processed: {processed_count} rows")
+        logging.info(f"New people: {new_people_count}")
+        logging.info(f"New contacts: {new_contacts_count}")
+        logging.info(f"Attendance records: {attendance_count}")
+        logging.info(f"Event total attendance: {final_attendance_count}")
+        logging.info(f"People attendance counts updated: {people_updated}")
 
     except Exception as e:
         conn.rollback()
@@ -589,6 +1004,17 @@ def process_event_csv(event_id, csv_path, event_name):
 
 def main():
     """Main entry point"""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Import Luma attendance CSVs to database'
+    )
+    parser.add_argument(
+        '--log-people',
+        action='store_true',
+        help='Print detailed person information as each row is processed'
+    )
+    args = parser.parse_args()
+
     # Read JSON from stdin (output from luma_sync.py)
     try:
         input_data = sys.stdin.read()
@@ -609,7 +1035,7 @@ def main():
             csv_path = event_data['csv_path']
             event_name = event_data.get('event_name', f"Event {event_id}")
 
-            process_event_csv(event_id, csv_path, event_name)
+            process_event_csv(event_id, csv_path, event_name, log_people=args.log_people)
 
         logging.info("All events processed successfully")
 
