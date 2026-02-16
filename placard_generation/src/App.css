@@ -1,12 +1,12 @@
 /* Title: 30% larger than previous, extra bold; logos & hero numbers scaled up */
 
 .dashboard-title {
-  font-size: clamp(1.95rem, 5.2vw, 2.95rem);
+  font-size: clamp(3.5rem, 8.5vw, 5rem);
   font-weight: 800;
 }
 
 .hero-number {
-  font-size: clamp(2.25rem, 5vw, 3rem);
+  font-size: clamp(3.8rem, 8.5vw, 5.2rem);
   line-height: 1.1;
 }
 
@@ -34,7 +34,7 @@
 }
 
 .hero-metric-label {
-  font-size: 14px;
+  font-size: 24px;
   font-weight: 600;
   color: #94A3B8;
   text-transform: uppercase;
@@ -44,7 +44,7 @@
 }
 
 .hero-metric-value {
-  font-size: clamp(2.75rem, 6.5vw, 3.75rem);
+  font-size: clamp(4.5rem, 10.5vw, 6.5rem);
   font-weight: 700;
   color: #DFCB63;
   line-height: 1.1;
@@ -86,7 +86,7 @@
 /* Section headers (Demographics + Retention): same font, left-aligned */
 .section-header {
   text-align: left;
-  font-size: 1.3rem;
+  font-size: 2.3rem;
   font-weight: 700;
   line-height: 1.3;
   color: #FFFFFF;
@@ -246,7 +246,7 @@
 }
 
 .financials-card-header {
-  font-size: 12px;
+  font-size: 22px;
   font-weight: 600;
   color: #94A3B8;
   text-transform: uppercase;
@@ -276,7 +276,7 @@
 }
 
 .financials-total-value {
-  font-size: clamp(1.25rem, 2.5vw, 1.5rem);
+  font-size: clamp(2.2rem, 4.5vw, 2.7rem);
   font-weight: 700;
   color: #DFCB63;
   line-height: 1.2;
@@ -284,7 +284,7 @@
 }
 
 .financials-total-label {
-  font-size: 10px;
+  font-size: 17px;
   font-weight: 500;
   color: #94A3B8;
   text-transform: uppercase;
@@ -306,7 +306,7 @@
 }
 
 .financials-unit-value {
-  font-size: clamp(0.8rem, 1.5vw, 0.95rem);
+  font-size: clamp(1.4rem, 2.6vw, 1.7rem);
   font-weight: 700;
   color: #DFCB63;
   line-height: 1.2;
@@ -314,7 +314,7 @@
 }
 
 .financials-unit-label {
-  font-size: 10px;
+  font-size: 17px;
   font-weight: 500;
   color: #94A3B8;
   text-transform: uppercase;

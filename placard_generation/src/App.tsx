@@ -196,8 +196,8 @@ function Delta({
   const arrow = isPos ? "↑ " : "↓ ";
   return (
     <span
-      className="text-sm font-semibold mt-1 block"
-      style={{ color: isPos ? GREEN : RED }}
+      className="font-semibold mt-1 block"
+      style={{ color: isPos ? GREEN : RED, fontSize: '1.5rem' }}
     >
       {arrow}{isPos ? "+" : ""}
       {value}%{suffix}
@@ -259,7 +259,7 @@ export default function App() {
   if (!eventData) {
     return (
       <div className="min-h-screen flex items-center justify-center text-white" style={{ background: "#0D121D" }}>
-        <p className="text-lg">Loading…</p>
+        <p className="text-2xl">Loading…</p>
       </div>
     );
   }
@@ -283,10 +283,10 @@ export default function App() {
           <h1 className="dashboard-title text-[#DFCB63] font-extrabold tracking-tight m-0 leading-tight">
             {meta.eventName}
           </h1>
-          <p className="text-white font-bold mt-1 text-lg">
+          <p className="text-white font-bold mt-1" style={{ fontSize: '1.8rem' }}>
             {meta.venue ? `@ ${meta.venue.split(' ')[0].replace(/,/g, '')}, ` : ""}{meta.date}
           </p>
-          <p className="text-[#94A3B8] text-sm mt-1">
+          <p className="text-[#94A3B8] mt-1" style={{ fontSize: '1.35rem' }}>
             Last event: {meta.lastEvent}, {meta.lastEventDate}
           </p>
         </div>
