@@ -59,16 +59,23 @@ def get_luma_events():
         logging.error("LUMA_API_KEY not found in environment variables")
         sys.exit(1)
 
+    if not LUMA_CALENDAR_ID:
+        logging.error("LUMA_CALENDAR_ID not found in environment variables")
+        sys.exit(1)
+
     headers = {
-        'x-luma-api-key': LUMA_API_KEY,
+        'Authorization': f'Bearer {LUMA_API_KEY}',
         'Content-Type': 'application/json'
     }
 
     try:
         # Luma API endpoint for listing calendar events
         url = f'{LUMA_API_BASE_URL}/calendar/list-events'
+        params = {
+            'calendar_api_id': LUMA_CALENDAR_ID
+        }
 
-        response = requests.get(url, headers=headers, timeout=30)
+        response = requests.get(url, headers=headers, params=params, timeout=30)
         response.raise_for_status()
 
         data = response.json()
@@ -93,35 +100,77 @@ def get_luma_events():
         sys.exit(1)
 
 
-def download_event_csv(event_api_id, save_path):
+def download_event_json(event_api_id, save_path):
     """
-    Download attendance CSV for a specific event from Luma
+    Download attendance JSON for a specific event from Luma with pagination support.
+
+    Fetches all guest pages using the Luma API's pagination (has_more, next_cursor).
+    Combines all entries into a single JSON file.
+
     Args:
         event_api_id: Luma event API ID
-        save_path: Path to save the CSV file
+        save_path: Path to save the JSON file
     Returns: True if successful, False otherwise
     """
     headers = {
-        'x-luma-api-key': LUMA_API_KEY,
+        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'Content-Type': 'application/json'
     }
 
     try:
-        # Luma API CSV export endpoint
-        url = f'{LUMA_API_BASE_URL}/event/get-guests-csv'
-        params = {'api_id': event_api_id}
+        # Luma API guests endpoint
+        url = f'{LUMA_API_BASE_URL}/event/get-guests'
 
-        response = requests.get(url, headers=headers, params=params, timeout=60, stream=True)
-        response.raise_for_status()
+        # Pagination: collect all entries across multiple pages
+        all_entries = []
+        next_cursor = None
+        page = 1
 
-        with open(save_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        while True:
+            # Build request parameters
+            params = {'event_api_id': event_api_id}
+            if next_cursor:
+                params['pagination_cursor'] = next_cursor
 
-        logging.info(f"Downloaded CSV for event {event_api_id} to {save_path}")
+            # Make API request
+            response = requests.get(url, headers=headers, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract and accumulate entries from this page
+            entries = data.get('entries', [])
+            all_entries.extend(entries)
+
+            logging.info(f"  Page {page}: fetched {len(entries)} guests (total so far: {len(all_entries)})")
+
+            # Check if there are more pages
+            if not data.get('has_more', False):
+                break
+
+            # Get cursor for next page
+            next_cursor = data.get('next_cursor')
+            if not next_cursor:
+                logging.warning(f"has_more is true but next_cursor is missing, stopping pagination")
+                break
+
+            page += 1
+
+        # Build complete response with all guests
+        complete_response = {
+            'entries': all_entries,
+            'has_more': False,
+            'total_count': len(all_entries)
+        }
+
+        # Save combined JSON response
+        with open(save_path, 'w') as f:
+            json.dump(complete_response, f, indent=2)
+
+        logging.info(f"Downloaded {len(all_entries)} total guests for event {event_api_id} ({page} page(s))")
         return True
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to download CSV for event {event_api_id}: {e}")
+        logging.error(f"Failed to download JSON for event {event_api_id}: {e}")
         return False
 
 
@@ -192,44 +241,93 @@ def create_event(cursor, luma_event):
     return event_id
 
 
-def update_event_if_missing(cursor, db_event_id, luma_event):
+def update_event_if_changed(cursor, db_event_id, luma_event):
     """
-    Update event fields that are NULL/missing in database
+    Update event fields that have changed from Luma API
+    Only updates fields that differ from current database values
     Args:
         cursor: Database cursor
         db_event_id: Database event ID
         luma_event: Luma event dictionary
     """
     # Extract fields from Luma event
-    event_name = luma_event.get('name', '')
-    timezone_str = luma_event.get('timezone')  # Get timezone from Luma
+    event_name = luma_event.get('name', '')[:100]  # Respect VARCHAR(100) limit
+    timezone_str = luma_event.get('timezone')
     start_datetime = parse_luma_datetime(luma_event.get('start_at'), timezone_str)
     description = luma_event.get('description', '')
     signup_url = luma_event.get('url', '')
     cover_image_url = luma_event.get('cover_url', '')
 
-    # Update fields - always update start_datetime to ensure correct timezone
-    # Other fields only update if NULL using COALESCE pattern
-    cursor.execute("""
-        UPDATE events
-        SET
-            event_name = COALESCE(NULLIF(event_name, ''), %s, event_name),
-            start_datetime = %s,
-            description = COALESCE(description, %s),
-            rsvp_link = COALESCE(rsvp_link, %s),
-            speaker_headshot_url = COALESCE(speaker_headshot_url, %s)
-        WHERE id = %s
-    """, (
-        event_name[:100],
-        start_datetime,
-        description,
-        signup_url,
-        cover_image_url,
-        db_event_id
-    ))
+    # Extract location from geo_address_json
+    geo_location = luma_event.get('geo_address_json', {})
+    location_str = geo_location.get('city', 'TBD') if isinstance(geo_location, dict) else 'TBD'
+    location_str = location_str[:100]  # Respect VARCHAR(100) limit
 
-    if cursor.rowcount > 0:
-        logging.info(f"Updated missing fields for event ID {db_event_id}")
+    # Fetch current values from database
+    cursor.execute("""
+        SELECT event_name, start_datetime, description, location, rsvp_link, speaker_headshot_url
+        FROM events
+        WHERE id = %s
+    """, (db_event_id,))
+
+    result = cursor.fetchone()
+    if not result:
+        logging.warning(f"Event ID {db_event_id} not found in database")
+        return
+
+    current_name, current_start, current_desc, current_location, current_rsvp, current_headshot = result
+
+    # Compare each field and track changes
+    changed_fields = []
+    update_parts = []
+    update_values = []
+
+    # Compare event_name
+    if current_name != event_name:
+        changed_fields.append('event_name')
+        update_parts.append('event_name = %s')
+        update_values.append(event_name)
+
+    # Compare start_datetime (handle potential microsecond differences)
+    if current_start != start_datetime:
+        changed_fields.append('start_datetime')
+        update_parts.append('start_datetime = %s')
+        update_values.append(start_datetime)
+
+    # Compare description
+    if current_desc != description:
+        changed_fields.append('description')
+        update_parts.append('description = %s')
+        update_values.append(description)
+
+    # Compare location
+    if current_location != location_str:
+        changed_fields.append('location')
+        update_parts.append('location = %s')
+        update_values.append(location_str)
+
+    # Compare rsvp_link
+    if current_rsvp != signup_url:
+        changed_fields.append('rsvp_link')
+        update_parts.append('rsvp_link = %s')
+        update_values.append(signup_url)
+
+    # Compare speaker_headshot_url
+    if current_headshot != cover_image_url:
+        changed_fields.append('speaker_headshot_url')
+        update_parts.append('speaker_headshot_url = %s')
+        update_values.append(cover_image_url)
+
+    # Only execute UPDATE if there are actual changes
+    if changed_fields:
+        update_query = f"UPDATE events SET {', '.join(update_parts)} WHERE id = %s"
+        update_values.append(db_event_id)
+
+        cursor.execute(update_query, update_values)
+
+        field_list = ', '.join(changed_fields)
+        field_count = len(changed_fields)
+        logging.info(f"Updated event ID {db_event_id}: {field_list} ({field_count} field{'s' if field_count != 1 else ''})")
 
 
 def parse_luma_datetime(datetime_str, timezone_str=None):
@@ -291,7 +389,7 @@ def sync_events():
         luma_events = get_luma_events()
 
         now = datetime.now()
-        one_day_ago = now - timedelta(days=1)
+        six_hours_ago = now - timedelta(hours=6)
 
         events_to_process = []
 
@@ -316,10 +414,10 @@ def sync_events():
                 if not exists:
                     create_event(cursor, luma_event)
                 else:
-                    update_event_if_missing(cursor, db_event_id, luma_event)
+                    update_event_if_changed(cursor, db_event_id, luma_event)
 
-            elif start_datetime < one_day_ago:
-                # Past event (>1 day old)
+            elif start_datetime < six_hours_ago:
+                # Past event (>6 hours old)
                 if not exists:
                     # Create the event first
                     db_event_id = create_event(cursor, luma_event)
@@ -327,20 +425,20 @@ def sync_events():
 
                 # Check if needs attendance processing
                 if attendance == 0:
-                    # Download CSV to temp file
+                    # Download JSON to temp file
                     temp_file = tempfile.NamedTemporaryFile(
-                        mode='w+b',
-                        suffix='.csv',
+                        mode='w',
+                        suffix='.json',
                         delete=False,
                         prefix=f'luma_event_{luma_event_id}_'
                     )
                     temp_path = temp_file.name
                     temp_file.close()
 
-                    if download_event_csv(luma_event_id, temp_path):
+                    if download_event_json(luma_event_id, temp_path):
                         events_to_process.append({
                             'event_id': db_event_id,
-                            'csv_path': temp_path,
+                            'json_path': temp_path,
                             'luma_event_id': luma_event_id,
                             'event_name': luma_event.get('name', 'Unknown')
                         })

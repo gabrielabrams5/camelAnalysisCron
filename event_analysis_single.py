@@ -216,6 +216,49 @@ def get_event_metrics(conn, event_id):
     return metrics
 
 
+def get_previous_events_by_datetime(conn, current_event_id, limit=4):
+    """
+    Get the previous N events before the current event, ordered by datetime.
+
+    Args:
+        conn: Database connection
+        current_event_id: ID of the current event
+        limit: Maximum number of previous events to return (default: 4)
+
+    Returns:
+        List of tuples (event_id, event_name, start_datetime) in reverse chronological order (most recent first)
+    """
+    cursor = conn.cursor()
+
+    try:
+        # Get current event's datetime
+        cursor.execute("""
+            SELECT start_datetime
+            FROM events
+            WHERE id = %s
+        """, (current_event_id,))
+
+        result = cursor.fetchone()
+        if not result:
+            return []
+
+        current_event_datetime = result[0]
+
+        # Get previous events ordered by datetime
+        cursor.execute("""
+            SELECT id, event_name, start_datetime
+            FROM events
+            WHERE start_datetime < %s
+            ORDER BY start_datetime DESC
+            LIMIT %s
+        """, (current_event_datetime, limit))
+
+        return cursor.fetchall()
+
+    finally:
+        cursor.close()
+
+
 def calculate_retention_rates(conn, current_event_id):
     """
     Calculate retention rates from previous 4 events.
@@ -236,35 +279,28 @@ def calculate_retention_rates(conn, current_event_id):
     current_attendees = pd.read_sql(current_attendees_query, conn, params=(current_event_id,))
     current_attendee_ids = set(current_attendees['person_id'].tolist())
 
-    for offset in range(1, 5):  # i-1, i-2, i-3, i-4
-        prev_event_id = current_event_id - offset
+    # Get previous events by datetime (chronologically ordered)
+    previous_events = get_previous_events_by_datetime(conn, current_event_id, limit=4)
 
-        if prev_event_id < 1:
-            # Event doesn't exist
+    # Process each previous event (i-1, i-2, i-3, i-4)
+    for offset in range(1, 5):
+        idx = offset - 1  # Convert to 0-based index
+
+        # Check if we have a previous event at this offset
+        if idx >= len(previous_events):
+            # No more previous events
             retention[f'return_rate_i_minus_{offset}'] = None
             retention[f'first_timer_return_rate_i_minus_{offset}'] = None
             retention[f'event_name_i_minus_{offset}'] = None
             retention[f'event_date_i_minus_{offset}'] = None
             continue
 
-        # Get previous event info
-        prev_event_query = """
-        SELECT event_name, start_datetime
-        FROM events
-        WHERE id = %s
-        """
-        prev_event_info = pd.read_sql(prev_event_query, conn, params=(prev_event_id,))
-
-        if prev_event_info.empty:
-            retention[f'return_rate_i_minus_{offset}'] = None
-            retention[f'first_timer_return_rate_i_minus_{offset}'] = None
-            retention[f'event_name_i_minus_{offset}'] = None
-            retention[f'event_date_i_minus_{offset}'] = None
-            continue
+        # Get event info from the datetime-ordered list
+        prev_event_id, prev_event_name, prev_event_datetime = previous_events[idx]
 
         # Store event name and date
-        retention[f'event_name_i_minus_{offset}'] = prev_event_info.iloc[0]['event_name']
-        retention[f'event_date_i_minus_{offset}'] = prev_event_info.iloc[0]['start_datetime']
+        retention[f'event_name_i_minus_{offset}'] = prev_event_name
+        retention[f'event_date_i_minus_{offset}'] = prev_event_datetime
 
         # Get previous event attendees
         prev_attendees_query = """
@@ -351,9 +387,10 @@ def main():
         conn.close()
         return
 
-    # Get metrics for previous event (event_id - 1)
-    prev_event_id = event_id - 1
-    prev_metrics = get_event_metrics(conn, prev_event_id)
+    # Get metrics for previous event (by datetime, not ID)
+    previous_events = get_previous_events_by_datetime(conn, event_id, limit=1)
+    prev_event_id = previous_events[0][0] if previous_events else None
+    prev_metrics = get_event_metrics(conn, prev_event_id) if prev_event_id else None
 
     # Calculate retention rates
     retention = calculate_retention_rates(conn, event_id)

@@ -40,6 +40,42 @@ def connect_to_db():
     return conn
 
 
+def customize_event_data(placard_csv_path, custom_title=None, custom_location=None):
+    """
+    Customize the title and/or location in the placard event data CSV.
+
+    The placard CSV uses a key-value format with 'key' and 'value' columns.
+
+    Args:
+        placard_csv_path: Path to the event_data.csv file
+        custom_title: Custom title to use (if provided)
+        custom_location: Custom location to use (if provided)
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Read the key-value CSV
+        df = pd.read_csv(placard_csv_path)
+
+        # Update the title (eventName key)
+        if custom_title:
+            df.loc[df['key'] == 'eventName', 'value'] = custom_title
+
+        # Update the location (venue key)
+        if custom_location:
+            df.loc[df['key'] == 'venue', 'value'] = custom_location
+
+        # Write back in key-value format (only key and value columns)
+        df[['key', 'value']].to_csv(placard_csv_path, index=False)
+        print(f"  ✓ Customized placard data")
+        return True
+
+    except Exception as e:
+        print(f"  ✗ Error customizing placard data: {e}", file=sys.stderr)
+        return False
+
+
 def transform_event(event_id, input_csv, placard_dir):
     """
     Run the transform script to convert event analysis to placard format.
@@ -243,6 +279,11 @@ def main():
         default=None,
         help='Optional: Directory to save PDF copies with event-specific names. If not provided, PDFs are only stored in the database.'
     )
+    parser.add_argument(
+        '--customize',
+        action='store_true',
+        help='Enable interactive customization of title and location for each event'
+    )
 
     args = parser.parse_args()
 
@@ -292,6 +333,7 @@ def main():
     for idx, row in df.iterrows():
         event_id = row['event_id']
         event_name = row.get('event_name', 'Unknown')
+        event_location = row.get('location', 'Unknown')
 
         print(f"[{idx + 1}/{total_events}] Processing event {event_id}: {event_name}")
 
@@ -300,6 +342,25 @@ def main():
             print(f"  ⚠ Skipping event {event_id} due to transform error\n")
             failed += 1
             continue
+
+        # Step 1.5: Customize if requested
+        if args.customize:
+            print(f"\n  Current title: {event_name}")
+            print(f"  Current location: {event_location}\n")
+
+            custom_title = input("  Enter custom title (or press Enter to keep current): ").strip()
+            custom_location = input("  Enter custom location (or press Enter to keep current): ").strip()
+
+            # Only customize if user provided values
+            if custom_title or custom_location:
+                placard_csv = os.path.join(placard_dir, 'public', 'event_data.csv')
+                if not customize_event_data(
+                    placard_csv,
+                    custom_title if custom_title else None,
+                    custom_location if custom_location else None
+                ):
+                    print(f"  ⚠ Warning: Could not customize event data for event {event_id}")
+            print()  # Add blank line for readability
 
         # Step 2: Generate PDF
         pdf_path = generate_pdf(placard_dir)

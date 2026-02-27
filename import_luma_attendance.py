@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Luma Attendance CSV Importer
-Processes Luma attendance CSVs and imports to database
+Luma Attendance JSON Importer
+Processes Luma attendance JSON data and imports to database
 Mimics logic from raw_csv_to_sql.py for person matching and data import
 """
 
@@ -10,7 +10,6 @@ import sys
 import json
 import logging
 import argparse
-import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
@@ -35,20 +34,19 @@ DB_CONFIG = {
     'password': os.getenv('PGPASSWORD')
 }
 
-# CSV column name mappings (update based on actual Luma CSV format)
-COLUMN_MAPPING = {
-    'first_name': 'First Name',
-    'last_name': 'Last Name',
-    'email': 'Email',
-    'school_email': 'What is your school email?',
-    'phone': 'Phone Number',
-    'approved': 'Order Status',
-    'checked_in': 'Tickets Scanned',
-    'rsvp_datetime': 'Order Date/Time',
-    'tracking_link': 'Tracking Link',
-    'gender': 'Detected Gender',
-    'school': 'What school do you go to?',
-    'class_year': 'What is your graduation year?',
+# JSON field mappings for Luma API response
+# These map our internal field names to the Luma API JSON field names
+# NOTE: Custom fields (gender, school, class_year) are in registration_answers, not top-level
+JSON_FIELD_MAPPING = {
+    'first_name': 'user_first_name',
+    'last_name': 'user_last_name',
+    'name': 'user_name',
+    'email': 'email',
+    'phone': 'phone_number',
+    'approved': 'approval_status',
+    'checked_in': 'checked_in_at',  # Luma uses timestamp, not boolean
+    'rsvp_datetime': 'created_at',
+    'tracking_link': 'custom_source',  # Luma's field for referral/invite token
 }
 
 # Fuzzy matching threshold
@@ -107,28 +105,120 @@ def ensure_connection(conn, force_refresh=False):
         return get_db_connection()
 
 
-def safe_get_column(df, column_name, default=pd.NA):
+def safe_get_field(data, field_name, default=None):
     """
-    Safely get column from dataframe, return default if doesn't exist.
+    Safely get field from JSON data dict, return default if doesn't exist.
 
     Args:
-        df: DataFrame to get column from
-        column_name: Name of column to retrieve
-        default: Default value if column doesn't exist (default: pd.NA)
+        data: Dictionary to get field from
+        field_name: Name of field to retrieve
+        default: Default value if field doesn't exist (default: None)
 
     Returns:
-        Series with column data or default values
+        Field value or default
     """
-    if column_name in df.columns:
-        return df[column_name]
-    return pd.Series([default] * len(df))
+    return data.get(field_name, default)
 
 
 def na_to_none(value):
-    """Convert pandas NA/NaN to None"""
-    if pd.isna(value):
+    """Convert None, empty string, or whitespace-only string to None"""
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
     return value
+
+
+def get_registration_answer(guest_data, question_label, case_sensitive=False):
+    """
+    Extract answer from registration_answers array by question label.
+
+    Custom fields in Luma API are stored in a registration_answers array like:
+    [
+        {"label": "School email (.edu)", "value": "student@harvard.edu"},
+        {"label": "What brings you to Camel?", "value": "..."}
+    ]
+
+    Args:
+        guest_data: Guest data dictionary from Luma API
+        question_label: The question label to search for
+        case_sensitive: If True, use exact case matching (default: False)
+
+    Returns:
+        The answer value if found, None otherwise
+    """
+    registration_answers = guest_data.get('registration_answers', [])
+
+    for answer in registration_answers:
+        answer_label = answer.get('label', '')
+
+        if case_sensitive:
+            if answer_label == question_label:
+                return na_to_none(answer.get('value'))
+        else:
+            if answer_label.lower() == question_label.lower():
+                return na_to_none(answer.get('value'))
+
+    return None
+
+
+def get_all_registration_answers(guest_data):
+    """
+    Extract all registration answers as a dictionary for storage in additional_info.
+
+    Args:
+        guest_data: Guest data dictionary from Luma API
+
+    Returns:
+        Dictionary mapping question labels to answer values
+    """
+    registration_answers = guest_data.get('registration_answers', [])
+    answers_dict = {}
+
+    for answer in registration_answers:
+        label = answer.get('label')
+        value = na_to_none(answer.get('value'))
+
+        if label and value is not None:
+            answers_dict[label] = value
+
+    return answers_dict if answers_dict else None
+
+
+def split_full_name(full_name):
+    """
+    Split a full name into first_name and last_name.
+    Uses "first word = first_name, rest = last_name" approach.
+
+    Args:
+        full_name: Full name string (e.g., "John Paul Smith")
+
+    Returns:
+        tuple: (first_name, last_name)
+
+    Examples:
+        "John Smith" -> ("John", "Smith")
+        "John Paul Smith" -> ("John", "Paul Smith")
+        "John" -> ("John", None)
+        "" -> (None, None)
+    """
+    if not full_name or not isinstance(full_name, str):
+        return None, None
+
+    full_name = full_name.strip()
+    if not full_name:
+        return None, None
+
+    # Split on whitespace
+    parts = full_name.split(None, 1)  # Split on first whitespace only
+
+    if len(parts) == 0:
+        return None, None
+    elif len(parts) == 1:
+        # Single name - use as first name
+        return parts[0].strip().title(), None
+    else:
+        # Multiple parts - first word is first_name, rest is last_name
+        return parts[0].strip().title(), parts[1].strip().title()
+
 
 
 def normalize_gender(gender_str):
@@ -136,7 +226,7 @@ def normalize_gender(gender_str):
     Normalize gender string to M/F/None
     From raw_csv_to_sql.py logic
     """
-    if pd.isna(gender_str):
+    if not gender_str:
         return None
 
     gender_lower = str(gender_str).lower().strip()
@@ -165,7 +255,7 @@ def normalize_school(school_str, email_str=None):
             return 'other'
 
     # Then check school string
-    if pd.isna(school_str):
+    if not school_str:
         return None
 
     school_lower = str(school_str).lower()
@@ -189,7 +279,7 @@ def normalize_class_year(year_str):
     Parse class year from various formats
     From raw_csv_to_sql.py logic
     """
-    if pd.isna(year_str):
+    if not year_str:
         return None
 
     year_str = str(year_str).lower().strip()
@@ -319,9 +409,9 @@ def update_names_if_substring(conn, person_id, sheet_first, sheet_last, input_fi
     Returns:
         None
     """
-    if pd.isna(sheet_first) or not sheet_first:
+    if not sheet_first:
         sheet_first = ""
-    if pd.isna(input_first) or not input_first:
+    if not input_first:
         input_first = ""
 
     updates = {}
@@ -330,7 +420,7 @@ def update_names_if_substring(conn, person_id, sheet_first, sheet_last, input_fi
         longer_first = max(sheet_first, input_first, key=len)
         updates['first_name'] = longer_first
 
-    if pd.notna(sheet_last) and pd.notna(input_last):
+    if sheet_last and input_last:
         if sheet_last.lower() in input_last.lower() or input_last.lower() in sheet_last.lower():
             longer_last = max(sheet_last, input_last, key=len)
             updates['last_name'] = longer_last
@@ -372,7 +462,7 @@ def match_tracking_link_to_person(conn, link_value, fuzzy_threshold=0.8):
     Returns:
         person_id if match found, else None
     """
-    if not link_value or pd.isna(link_value):
+    if not link_value:
         return None
 
     # Clean the link value
@@ -442,7 +532,7 @@ def match_tracking_link_to_person(conn, link_value, fuzzy_threshold=0.8):
 
 def find_person_by_email(cursor, email):
     """Find person by email (school or personal)"""
-    if not email or pd.isna(email):
+    if not email:
         return None
 
     email = email.lower().strip()
@@ -458,7 +548,7 @@ def find_person_by_email(cursor, email):
 
 def find_person_by_phone(cursor, phone):
     """Find person by phone number"""
-    if not phone or pd.isna(phone):
+    if not phone:
         return None
 
     phone = str(phone).strip()
@@ -474,7 +564,7 @@ def find_person_by_phone(cursor, phone):
 
 def find_person_by_name(cursor, first_name, last_name):
     """Find person by exact name match"""
-    if not first_name or not last_name or pd.isna(first_name) or pd.isna(last_name):
+    if not first_name or not last_name:
         return None
 
     first_name = str(first_name).strip().title()
@@ -548,6 +638,13 @@ def create_person(cursor, row_data):
         row_data: Dictionary with person data
     Returns: person_id
     """
+    import json
+
+    # Convert additional_info dict to JSON string if present
+    additional_info_json = None
+    if row_data.get('additional_info'):
+        additional_info_json = json.dumps(row_data['additional_info'])
+
     cursor.execute("""
         INSERT INTO people (
             first_name,
@@ -555,15 +652,17 @@ def create_person(cursor, row_data):
             gender,
             class_year,
             school,
-            preferred_name
-        ) VALUES (%s, %s, %s, %s, %s, NULL)
+            preferred_name,
+            additional_info
+        ) VALUES (%s, %s, %s, %s, %s, NULL, %s)
         RETURNING id
     """, (
         row_data['first_name'],
         row_data['last_name'],
         row_data['gender'],
         row_data['class_year'],
-        row_data['school']
+        row_data['school'],
+        additional_info_json
     ))
 
     person_id = cursor.fetchone()[0]
@@ -580,13 +679,21 @@ def update_contact_info(cursor, person_id, row_data):
     Returns:
         bool: True if any contact info was updated, False otherwise
     """
+    import json
+
     school_email = row_data.get('school_email')
     personal_email = row_data.get('personal_email')
     phone = row_data.get('phone')
+    additional_info = row_data.get('additional_info')
+
+    # Convert additional_info dict to JSON string if present
+    additional_info_json = None
+    if additional_info:
+        additional_info_json = json.dumps(additional_info)
 
     # Check current values before update
     cursor.execute("""
-        SELECT school_email, personal_email, phone_number
+        SELECT school_email, personal_email, phone_number, additional_info
         FROM people
         WHERE id = %s
     """, (person_id,))
@@ -595,7 +702,7 @@ def update_contact_info(cursor, person_id, row_data):
     if not current:
         return False
 
-    current_school_email, current_personal_email, current_phone = current
+    current_school_email, current_personal_email, current_phone, current_additional_info = current
 
     # Update contact info
     cursor.execute("""
@@ -603,9 +710,10 @@ def update_contact_info(cursor, person_id, row_data):
         SET
             school_email = COALESCE(school_email, %s),
             personal_email = COALESCE(personal_email, %s),
-            phone_number = COALESCE(phone_number, %s)
+            phone_number = COALESCE(phone_number, %s),
+            additional_info = COALESCE(additional_info, %s)
         WHERE id = %s
-    """, (school_email, personal_email, phone, person_id))
+    """, (school_email, personal_email, phone, additional_info_json, person_id))
 
     # Check if any field was updated (was NULL and now has a value)
     updated = False
@@ -615,11 +723,13 @@ def update_contact_info(cursor, person_id, row_data):
         updated = True
     if current_phone is None and phone is not None:
         updated = True
+    if current_additional_info is None and additional_info_json is not None:
+        updated = True
 
     return updated
 
 
-def find_or_create_person(conn, cursor, row):
+def find_or_create_person(conn, cursor, guest_data):
     """
     Find existing person or create new one
     Multi-strategy matching: email -> phone -> exact name -> fuzzy name -> create
@@ -628,17 +738,41 @@ def find_or_create_person(conn, cursor, row):
     Args:
         conn: Database connection (needed for update_names_if_substring)
         cursor: Database cursor
-        row: Row data from CSV
+        guest_data: Guest data dictionary from JSON
     """
-    # Extract data from row
-    first_name = na_to_none(row.get(COLUMN_MAPPING['first_name']))
-    last_name = na_to_none(row.get(COLUMN_MAPPING['last_name']))
-    email = na_to_none(row.get(COLUMN_MAPPING['email']))
-    school_email = na_to_none(row.get(COLUMN_MAPPING.get('school_email', 'N/A')))
-    phone = na_to_none(row.get(COLUMN_MAPPING.get('phone', 'N/A')))
-    gender_raw = na_to_none(row.get(COLUMN_MAPPING.get('gender', 'N/A')))
-    school_raw = na_to_none(row.get(COLUMN_MAPPING.get('school', 'N/A')))
-    year_raw = na_to_none(row.get(COLUMN_MAPPING.get('class_year', 'N/A')))
+    # Extract data from guest_data using JSON field mappings
+    first_name = na_to_none(guest_data.get(JSON_FIELD_MAPPING['first_name']))
+    last_name = na_to_none(guest_data.get(JSON_FIELD_MAPPING['last_name']))
+    full_name = na_to_none(guest_data.get(JSON_FIELD_MAPPING.get('name')))
+    email = na_to_none(guest_data.get(JSON_FIELD_MAPPING['email']))
+    phone = na_to_none(guest_data.get(JSON_FIELD_MAPPING.get('phone')))
+
+    # If first_name and last_name are blank, try splitting the full name
+    if not first_name and not last_name and full_name:
+        first_name, last_name = split_full_name(full_name)
+        logging.info(f"Split name '{full_name}' into first='{first_name}' last='{last_name}'")
+
+    # Extract school email from registration_answers (prioritize this over main email)
+    school_email_from_reg = get_registration_answer(guest_data, 'School email (.edu)')
+
+    # Extract custom fields from registration_answers
+    gender_raw = get_registration_answer(guest_data, 'Gender')
+    school_raw = get_registration_answer(guest_data, 'School')
+    if not school_raw:
+        # Try alternate question labels
+        school_raw = get_registration_answer(guest_data, 'What school do you go to?')
+
+    year_raw = get_registration_answer(guest_data, 'Grad year')
+    if not year_raw:
+        # Try alternate question labels
+        year_raw = get_registration_answer(guest_data, 'Graduation Year')
+        if not year_raw:
+            year_raw = get_registration_answer(guest_data, 'Class Year')
+
+    # Skip guests with no name data - database requires NOT NULL for names
+    if not first_name and not last_name:
+        logging.warning(f"Skipping guest with no name data (email: {email or 'N/A'}, phone: {phone or 'N/A'})")
+        return None, False, False
 
     # Normalize data
     if first_name:
@@ -646,22 +780,35 @@ def find_or_create_person(conn, cursor, row):
     if last_name:
         last_name = last_name.strip().title()
 
+    # If only one name field is missing, we still can't proceed (both are NOT NULL)
+    if not first_name or not last_name:
+        logging.warning(f"Skipping guest with incomplete name (first: {first_name or 'N/A'}, last: {last_name or 'N/A'}, email: {email or 'N/A'})")
+        return None, False, False
+
     gender = normalize_gender(gender_raw)
 
     # Determine which email is school vs personal
-    primary_email = school_email if school_email else email
-    is_school_email = primary_email and '.edu' in str(primary_email).lower()
-
-    if is_school_email:
-        school_email_final = primary_email
-        personal_email_final = email if email and email != school_email else None
+    # Priority: 1) school_email from registration_answers, 2) email field if .edu
+    if school_email_from_reg:
+        school_email_final = school_email_from_reg
+        # If main email is different from school email, treat it as personal email
+        personal_email_final = email if email and email.lower() != school_email_from_reg.lower() else None
     else:
-        school_email_final = None
-        personal_email_final = primary_email
+        # Fall back to checking if main email is a .edu address
+        is_school_email = email and '.edu' in str(email).lower()
+        if is_school_email:
+            school_email_final = email
+            personal_email_final = None
+        else:
+            school_email_final = None
+            personal_email_final = email
 
-    # Normalize school and year
-    school = normalize_school(school_raw, primary_email)
+    # Normalize school and year (use school_email_final for normalization)
+    school = normalize_school(school_raw, school_email_final)
     class_year = normalize_class_year(year_raw)
+
+    # Extract all registration answers for storage in additional_info
+    additional_info = get_all_registration_answers(guest_data)
 
     # Prepare row data
     row_data = {
@@ -672,7 +819,8 @@ def find_or_create_person(conn, cursor, row):
         'phone': str(phone).strip() if phone else None,
         'gender': gender,
         'school': school,
-        'class_year': class_year
+        'class_year': class_year,
+        'additional_info': additional_info
     }
 
     # Try matching strategies in order
@@ -724,7 +872,7 @@ def find_or_create_invite_token(cursor, event_id, tracking_link):
     Find or create invite token
     From raw_csv_to_sql.py logic
     """
-    if not tracking_link or pd.isna(tracking_link):
+    if not tracking_link:
         tracking_link = 'default'
 
     tracking_link = str(tracking_link).strip()[:100]  # Respect VARCHAR(100) limit
@@ -758,7 +906,7 @@ def find_or_create_invite_token(cursor, event_id, tracking_link):
     return token_id
 
 
-def create_attendance_record(cursor, person_id, event_id, row):
+def create_attendance_record(cursor, person_id, event_id, guest_data):
     """
     Create attendance record for person at event
     From raw_csv_to_sql.py logic
@@ -766,32 +914,33 @@ def create_attendance_record(cursor, person_id, event_id, row):
     Returns:
         tuple: (tracking_link, checked_in) for referral tracking
     """
-    # Parse attendance fields
-    approved_status = na_to_none(row.get(COLUMN_MAPPING['approved']))
-    checked_in_value = na_to_none(row.get(COLUMN_MAPPING['checked_in']))
-    rsvp_datetime_str = na_to_none(row.get(COLUMN_MAPPING.get('rsvp_datetime', 'N/A')))
-    tracking_link = na_to_none(row.get(COLUMN_MAPPING.get('tracking_link', 'N/A')))
+    # Parse attendance fields from JSON
+    approved_status = na_to_none(guest_data.get(JSON_FIELD_MAPPING['approved']))
+    checked_in_value = na_to_none(guest_data.get(JSON_FIELD_MAPPING['checked_in']))
+    rsvp_datetime_str = na_to_none(guest_data.get(JSON_FIELD_MAPPING.get('rsvp_datetime')))
+    tracking_link = na_to_none(guest_data.get(JSON_FIELD_MAPPING.get('tracking_link')))
 
     # Determine rsvp, approved, checked_in booleans
     rsvp = approved_status is not None
-    approved = str(approved_status).lower() == 'completed' if approved_status else False
-    checked_in = str(checked_in_value).lower() in ['1', '1.0', 'true', 'yes'] if checked_in_value else False
+    # Luma API uses 'approved' status for completed registrations
+    approved = str(approved_status).lower() == 'approved' if approved_status else False
+    # checked_in_at is a timestamp - if present and non-empty, person is checked in
+    checked_in = bool(checked_in_value) if checked_in_value else False
 
     # Parse RSVP datetime
     rsvp_datetime = None
     if rsvp_datetime_str:
         try:
-            # Try parsing common formats
-            rsvp_datetime = pd.to_datetime(rsvp_datetime_str, errors='coerce')
-            if pd.isna(rsvp_datetime):
-                rsvp_datetime = None
+            # Parse ISO format datetime
+            rsvp_datetime = datetime.fromisoformat(rsvp_datetime_str.replace('Z', '+00:00'))
         except:
             rsvp_datetime = None
 
     # Get or create invite token
     invite_token_id = find_or_create_invite_token(cursor, event_id, tracking_link)
 
-    # Insert attendance record (ON CONFLICT DO NOTHING prevents duplicates)
+    # Insert or update attendance record
+    # ON CONFLICT DO UPDATE allows re-importing to update checked_in and other status changes
     cursor.execute("""
         INSERT INTO attendance (
             person_id,
@@ -803,7 +952,12 @@ def create_attendance_record(cursor, person_id, event_id, row):
             is_first_event,
             invite_token_id
         ) VALUES (%s, %s, %s, %s, %s, %s, FALSE, %s)
-        ON CONFLICT (person_id, event_id) DO NOTHING
+        ON CONFLICT (person_id, event_id) DO UPDATE SET
+            rsvp = EXCLUDED.rsvp,
+            approved = EXCLUDED.approved,
+            checked_in = EXCLUDED.checked_in,
+            rsvp_datetime = EXCLUDED.rsvp_datetime,
+            invite_token_id = EXCLUDED.invite_token_id
     """, (
         person_id,
         event_id,
@@ -847,54 +1001,61 @@ def create_attendance_record(cursor, person_id, event_id, row):
     return tracking_link, checked_in
 
 
-def process_event_csv(event_id, csv_path, event_name, log_people=False):
+def process_event_json(event_id, json_path, event_name, log_people=False):
     """
-    Process a single event CSV file
+    Process a single event JSON file
     Args:
         event_id: Database event ID
-        csv_path: Path to CSV file
+        json_path: Path to JSON file
         event_name: Name of event for logging
-        log_people: If True, print person information as each row is processed
+        log_people: If True, print person information as each guest is processed
     """
-    logging.info(f"Processing CSV for event: {event_name} (ID: {event_id})")
+    logging.info(f"Processing JSON for event: {event_name} (ID: {event_id})")
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
-        # Read CSV
-        df = pd.read_csv(csv_path)
-        logging.info(f"Read {len(df)} rows from CSV")
+        # Read JSON file
+        with open(json_path, 'r') as f:
+            response_data = json.load(f)
 
-        # Detect referral column if it exists
-        referral_column = None
-        possible_referral_columns = [
-            'How did you hear about this event?',
-            'Who referred you?',
-            'Referral',
-            'Referred by'
-        ]
-        for col in possible_referral_columns:
-            if col in df.columns:
-                referral_column = col
-                logging.info(f"Detected referral column: {referral_column}")
-                break
+        # Extract entries array from response
+        # The Luma API returns an 'entries' array where each entry contains a nested 'guest' object
+        guests = response_data.get('entries', [])
+        logging.info(f"Read {len(guests)} guest entries from JSON")
 
-        # Process each row
+        # Process each guest
         attendance_count = 0
         processed_count = 0
         new_people_count = 0
         new_contacts_count = 0
-        for idx, row in df.iterrows():
+        for entry in guests:
+            # Extract nested guest object from entry
+            # Luma API structure: entries[i].guest contains the actual guest data
+            guest_data = entry.get('guest', {})
+
+            # Skip entries that don't have a guest object
+            if not guest_data:
+                logging.warning(f"Entry missing 'guest' object: {entry.get('api_id', 'unknown')}")
+                processed_count += 1
+                continue
+
             # Find or create person
-            person_id, was_created, contact_updated = find_or_create_person(conn, cursor, row)
+            person_id, was_created, contact_updated = find_or_create_person(conn, cursor, guest_data)
+
+            # Skip if person couldn't be created (missing required data like name)
+            if person_id is None:
+                processed_count += 1
+                continue
+
             if was_created:
                 new_people_count += 1
             if contact_updated:
                 new_contacts_count += 1
 
             # Create attendance record
-            tracking_link, checked_in = create_attendance_record(cursor, person_id, event_id, row)
+            tracking_link, checked_in = create_attendance_record(cursor, person_id, event_id, guest_data)
             attendance_count += 1
 
             # Log person information if logging is enabled
@@ -914,12 +1075,10 @@ def process_event_csv(event_id, csv_path, event_name, log_people=False):
                 finally:
                     log_cursor.close()
 
-                # Determine referral code from invite token or referral column
+                # Determine referral code from invite token
                 referral_code = "N/A"
-                if tracking_link and not pd.isna(tracking_link) and str(tracking_link).lower() not in ['default', 'email', 'txt', 'insta', 'maillist']:
+                if tracking_link and str(tracking_link).lower() not in ['default', 'email', 'txt', 'insta', 'maillist']:
                     referral_code = str(tracking_link)
-                elif referral_column and referral_column in row.index and not pd.isna(row[referral_column]):
-                    referral_code = str(row[referral_column])
 
                 # Attendance status
                 attendance_status = "✓ Attended" if checked_in else "✗ No-show"
@@ -931,21 +1090,11 @@ def process_event_csv(event_id, csv_path, event_name, log_people=False):
             if checked_in:
                 referrer_id = None
 
-                # 1. Check tracking link for referral
-                if tracking_link and not pd.isna(tracking_link):
+                # Check tracking link for referral
+                if tracking_link:
                     referrer_id = match_tracking_link_to_person(conn, tracking_link)
                     if referrer_id:
                         logging.info(f"  → Tracking link '{tracking_link}' matched to person ID {referrer_id}")
-
-                # 2. Check referral column if it exists
-                if referral_column and referral_column in row.index and not pd.isna(row[referral_column]):
-                    referrer_name = str(row[referral_column]).strip()
-                    # Try to match the referrer name to a person
-                    # Use fuzzy matching on the referrer name
-                    referrer_matches = fuzzy_match_name(cursor, referrer_name, "")
-                    if referrer_matches:
-                        referrer_id = referrer_matches
-                        logging.info(f"  → Referral column '{referrer_name}' matched to person ID {referrer_id}")
 
                 # Increment referral count
                 if referrer_id and referrer_id != person_id:  # Don't count self-referrals
@@ -960,13 +1109,13 @@ def process_event_csv(event_id, csv_path, event_name, log_people=False):
 
             # Refresh connection periodically to prevent timeouts
             if processed_count % CONNECTION_REFRESH_INTERVAL == 0:
-                logging.info(f"\n--- Processed {processed_count} rows, refreshing connection ---")
+                logging.info(f"\n--- Processed {processed_count} guests, refreshing connection ---")
                 conn = ensure_connection(conn, force_refresh=True)
                 cursor.close()
                 cursor = conn.cursor()
             elif processed_count % 10 == 0:
                 conn.commit()
-                logging.info(f"Processed {processed_count}/{len(df)} rows...")
+                logging.info(f"Processed {processed_count}/{len(guests)} guests...")
 
         # Final commit
         conn.commit()
@@ -979,7 +1128,7 @@ def process_event_csv(event_id, csv_path, event_name, log_people=False):
 
         # Print enhanced statistics
         logging.info(f"\n=== Import Complete for {event_name} ===")
-        logging.info(f"Processed: {processed_count} rows")
+        logging.info(f"Processed: {processed_count} guests")
         logging.info(f"New people: {new_people_count}")
         logging.info(f"New contacts: {new_contacts_count}")
         logging.info(f"Attendance records: {attendance_count}")
@@ -988,16 +1137,16 @@ def process_event_csv(event_id, csv_path, event_name, log_people=False):
 
     except Exception as e:
         conn.rollback()
-        logging.error(f"Error processing CSV for event {event_name}: {e}")
+        logging.error(f"Error processing JSON for event {event_name}: {e}")
         raise
     finally:
         cursor.close()
         conn.close()
 
-        # Clean up CSV file
+        # Clean up JSON file
         try:
-            os.unlink(csv_path)
-            logging.info(f"Deleted temporary CSV file: {csv_path}")
+            os.unlink(json_path)
+            logging.info(f"Deleted temporary JSON file: {json_path}")
         except:
             pass
 
@@ -1006,12 +1155,12 @@ def main():
     """Main entry point"""
     # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description='Import Luma attendance CSVs to database'
+        description='Import Luma attendance JSON data to database'
     )
     parser.add_argument(
         '--log-people',
         action='store_true',
-        help='Print detailed person information as each row is processed'
+        help='Print detailed person information as each guest is processed'
     )
     args = parser.parse_args()
 
@@ -1032,10 +1181,10 @@ def main():
 
         for event_data in events:
             event_id = event_data['event_id']
-            csv_path = event_data['csv_path']
+            json_path = event_data['json_path']
             event_name = event_data.get('event_name', f"Event {event_id}")
 
-            process_event_csv(event_id, csv_path, event_name, log_people=args.log_people)
+            process_event_json(event_id, json_path, event_name, log_people=args.log_people)
 
         logging.info("All events processed successfully")
 
