@@ -15,7 +15,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY analyze.py .
 COPY luma_sync.py .
 COPY import_luma_attendance.py .
+COPY event_analysis_single.py .
+COPY generate_all_placards.py .
 COPY run_luma_pipeline.sh .
+
+# Copy directories
+COPY luma/ /app/luma/
+COPY mailChimp/ /app/mailChimp/
+COPY placard_generation/ /app/placard_generation/
 
 # Create output directory for analysis files (will be mounted as volume)
 RUN mkdir -p /app/analysis_outputs
