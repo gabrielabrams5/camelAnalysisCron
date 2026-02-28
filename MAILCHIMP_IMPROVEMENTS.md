@@ -273,5 +273,90 @@ WHERE school_email LIKE '%-deleted%' OR personal_email LIKE '%-deleted%';
 
 ---
 
-Generated: 2026-02-18
+## 6. Separate Tags for First-Time vs Returning Attendees
+
+### Feature Added
+The tagging system now automatically differentiates between first-time and returning attendees when tagging events in Mailchimp.
+
+### Previous Behavior
+All attendees received the same tag:
+- `{event_name}_attended` - All attendees (first-time and returning)
+
+### New Behavior
+Attendees are tagged based on their attendance history:
+- `{event_name}_first_attended` - First-time attendees (from `is_first_event` field)
+- `{event_name}_attended` - Returning attendees
+
+**RSVP no-shows remain unchanged:**
+- `{event_name}_rsvp_no_show` - All no-shows (no differentiation)
+
+### How It Works
+
+The system uses the existing `is_first_event` field in the `attendance` table:
+
+```sql
+-- Field already exists in attendance table
+is_first_event BOOLEAN NOT NULL DEFAULT false
+```
+
+This field is set to `TRUE` only for a person's first event they checked into (chronologically by event_id).
+
+### Example Output
+
+Running the tagging script now shows a breakdown:
+
+```bash
+$ python mailChimp/tag_mailchimp_attendees.py --event-id 123
+
+Event: Spring Mixer 2024
+Event ID: 123
+
+Groups to tag:
+  Checked-in attendees: 45
+    First-time attendees: 12 (tag: spring_mixer_2024_first_attended)
+    Returning attendees: 33 (tag: spring_mixer_2024_attended)
+  RSVP no-shows: 8
+    Tag: spring_mixer_2024_rsvp_no_show
+```
+
+### Benefits
+
+1. **Better Segmentation**: Create targeted campaigns for first-time attendees (welcome emails, onboarding)
+2. **Engagement Tracking**: Identify which events attract new members vs retain existing ones
+3. **Email Personalization**: Send different follow-up emails based on attendance history
+4. **Analytics**: Measure first-time vs returning attendance rates per event
+
+### Files Modified
+
+- ✅ `mailChimp/mailchimp_client.py` - Updated `batch_tag_attendees()` to accept `is_first_event` field
+- ✅ `mailChimp/tag_mailchimp_attendees.py` - Now passes `is_first_event` data from database to tagging function
+
+### Technical Details
+
+The `batch_tag_attendees()` function now checks each attendee's `is_first_event` field:
+
+```python
+# Logic in mailchimp_client.py
+is_first_event = attendee.get('is_first_event', False)
+if is_first_event and tag_suffix == "attended":
+    attendee_tag_suffix = "first_attended"
+else:
+    attendee_tag_suffix = tag_suffix
+```
+
+### Use Cases in Mailchimp
+
+**Create audience segments:**
+- All first-time attendees: Filter by any tag ending in `_first_attended`
+- Returning attendees for specific event: Filter by `{event}_attended` tag
+- Compare first-timer vs returner engagement rates
+
+**Automated campaigns:**
+1. Welcome email to all `*_first_attended` tags
+2. "Welcome back" email to all `*_attended` tags (excluding first-timers)
+3. Different post-event surveys for each group
+
+---
+
+Generated: 2026-02-18 (Updated: 2026-02-28)
 Based on: Real-world sync of 2091 contacts with 75.8% success rate

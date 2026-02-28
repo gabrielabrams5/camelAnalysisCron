@@ -76,6 +76,7 @@ def get_event_attendees(event_id: int) -> tuple[Optional[str], List[Dict[str, st
             - email: Email address (unique per event)
             - first_name: First name
             - last_name: Last name
+            - is_first_event: Boolean indicating if this is their first event
 
     Raises:
         ValueError: If event_id not found in database
@@ -149,7 +150,8 @@ def get_event_attendees(event_id: int) -> tuple[Optional[str], List[Dict[str, st
             attendees.append({
                 'email': email,
                 'first_name': first_name,
-                'last_name': last_name
+                'last_name': last_name,
+                'is_first_event': is_first_event
             })
 
         logging.info(
@@ -339,9 +341,18 @@ def main():
         print(f"\nEvent: {event_name}")
         print(f"Event ID: {args.event_id}")
         print(f"\nGroups to tag:")
+
+        # Count first-time vs returning attendees
+        first_time_count = sum(1 for a in attendees if a.get('is_first_event', False))
+        returning_count = len(attendees) - first_time_count
+
         print(f"  Checked-in attendees: {len(attendees)}")
         if attendees:
-            print(f"    Tag: {sanitize_event_name(event_name)}_attended")
+            if first_time_count > 0:
+                print(f"    First-time attendees: {first_time_count} (tag: {sanitize_event_name(event_name)}_first_attended)")
+            if returning_count > 0:
+                print(f"    Returning attendees: {returning_count} (tag: {sanitize_event_name(event_name)}_attended)")
+
         if not args.only_attendees:
             print(f"  RSVP no-shows: {len(rsvp_no_shows)}")
             if rsvp_no_shows:
@@ -351,11 +362,23 @@ def main():
             print("\n[DRY RUN MODE - Skipping Mailchimp API calls]")
 
             if attendees:
-                print("\nAttendees to be tagged with '_attended':")
-                for i, attendee in enumerate(attendees[:10], 1):  # Show first 10
-                    print(f"  {i}. {attendee['first_name']} {attendee['last_name']} <{attendee['email']}>")
-                if len(attendees) > 10:
-                    print(f"  ... and {len(attendees) - 10} more")
+                # Show first-time attendees
+                first_timers = [a for a in attendees if a.get('is_first_event', False)]
+                if first_timers:
+                    print("\nFirst-time attendees to be tagged with '_first_attended':")
+                    for i, attendee in enumerate(first_timers[:10], 1):  # Show first 10
+                        print(f"  {i}. {attendee['first_name']} {attendee['last_name']} <{attendee['email']}>")
+                    if len(first_timers) > 10:
+                        print(f"  ... and {len(first_timers) - 10} more")
+
+                # Show returning attendees
+                returning = [a for a in attendees if not a.get('is_first_event', False)]
+                if returning:
+                    print("\nReturning attendees to be tagged with '_attended':")
+                    for i, attendee in enumerate(returning[:10], 1):  # Show first 10
+                        print(f"  {i}. {attendee['first_name']} {attendee['last_name']} <{attendee['email']}>")
+                    if len(returning) > 10:
+                        print(f"  ... and {len(returning) - 10} more")
 
             if rsvp_no_shows:
                 print("\nRSVP no-shows to be tagged with '_rsvp_no_show':")

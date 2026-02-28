@@ -109,12 +109,15 @@ def batch_tag_attendees(
     This function:
     1. Batch upserts all attendees to the Mailchimp audience (creates/updates)
     2. Tags each attendee with "{sanitized_event_name}_{tag_suffix}"
+       - For first-time attendees (is_first_event=True) with tag_suffix="attended",
+         uses "first_attended" instead
 
     Args:
         attendees: List of attendee dictionaries with keys:
             - email: Email address (required)
             - first_name: First name (optional)
             - last_name: Last name (optional)
+            - is_first_event: Boolean indicating if this is their first event (optional)
         event_name: Name of the event (will be sanitized for tag)
         audience_id: Mailchimp audience/list ID (defaults to env var)
         tag_suffix: Suffix for the tag (default: "attended")
@@ -229,6 +232,15 @@ def batch_tag_attendees(
             if not email:
                 continue
 
+            # Determine the appropriate tag suffix for this attendee
+            # For first-time attendees with "attended" suffix, use "first_attended"
+            attendee_tag_suffix = tag_suffix
+            is_first_event = attendee.get('is_first_event', False)
+            if is_first_event and tag_suffix == "attended":
+                attendee_tag_suffix = "first_attended"
+
+            attendee_tag_name = f"{sanitized_event}_{attendee_tag_suffix}"
+
             try:
                 subscriber_hash = _subscriber_hash(email)
                 client.lists.update_list_member_tags(
@@ -236,7 +248,7 @@ def batch_tag_attendees(
                     subscriber_hash,
                     {
                         "tags": [
-                            {"name": tag_name, "status": "active"}
+                            {"name": attendee_tag_name, "status": "active"}
                         ]
                     }
                 )
@@ -244,13 +256,13 @@ def batch_tag_attendees(
 
             except ApiClientError as e:
                 logging.warning(
-                    f"Failed to tag {email} with '{tag_name}': {e.text}"
+                    f"Failed to tag {email} with '{attendee_tag_name}': {e.text}"
                 )
                 stats['errors'] += 1
 
         logging.info(
-            f"Tagging complete: {stats['tagged']}/{stats['total']} attendees "
-            f"tagged with '{tag_name}'"
+            f"Tagging complete: {stats['tagged']}/{stats['total']} attendees tagged "
+            f"(using '{sanitized_event}_{{attended|first_attended}}' tags)"
         )
 
     except Exception as e:

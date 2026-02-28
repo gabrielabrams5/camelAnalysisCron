@@ -81,7 +81,8 @@ Step 4: For each newly imported event:
   ├─ event_analysis_single.py
   │   └─ Generate comprehensive event analysis CSV
   └─ tag_mailchimp_attendees.py (if Mailchimp configured)
-      ├─ Tag attendees with {event}_attended
+      ├─ Tag first-time attendees with {event}_first_attended
+      ├─ Tag returning attendees with {event}_attended
       └─ Tag RSVP no-shows with {event}_rsvp_no_show
   ↓
 Step 5: generate_all_placards.py
@@ -857,24 +858,25 @@ python mailChimp/tag_mailchimp_attendees.py --event-id 123 --verbose
 
 ### What It Does
 
-**By default**, the script tags **two groups**:
+**By default**, the script tags **two groups** with **differentiation for first-time vs returning attendees**:
 
 1. **Attendees** (people who checked in):
    - Queries the Railway PostgreSQL database where `checked_in = TRUE`
-   - Extracts first_name, last_name, and email for each attendee
+   - Extracts first_name, last_name, email, and `is_first_event` flag for each attendee
    - Batch upserts contacts to Mailchimp (creates new or updates existing)
-   - Tags all contacts with `{sanitized_event_name}_attended`
+   - **First-time attendees**: Tagged with `{sanitized_event_name}_first_attended`
+   - **Returning attendees**: Tagged with `{sanitized_event_name}_attended`
 
 2. **RSVP No-Shows** (people who registered but didn't attend):
    - Queries the database where `checked_in = FALSE`
    - Extracts contact information for each RSVP
    - Batch upserts contacts to Mailchimp
-   - Tags all contacts with `{sanitized_event_name}_rsvp_no_show`
+   - Tags all contacts with `{sanitized_event_name}_rsvp_no_show` (no differentiation)
 
 **Tag Format Examples:**
-- "Spring 2024 Mixer" → `spring_2024_mixer_attended` and `spring_2024_mixer_rsvp_no_show`
-- "Coffee & Coding!" → `coffee_coding_attended` and `coffee_coding_rsvp_no_show`
-- "Speaker Series: AI" → `speaker_series_ai_attended` and `speaker_series_ai_rsvp_no_show`
+- "Spring 2024 Mixer" → `spring_2024_mixer_first_attended`, `spring_2024_mixer_attended`, and `spring_2024_mixer_rsvp_no_show`
+- "Coffee & Coding!" → `coffee_coding_first_attended`, `coffee_coding_attended`, and `coffee_coding_rsvp_no_show`
+- "Speaker Series: AI" → `speaker_series_ai_first_attended`, `speaker_series_ai_attended`, and `speaker_series_ai_rsvp_no_show`
 
 ### Example Output
 
@@ -884,7 +886,8 @@ Event ID: 123
 
 Groups to tag:
   Checked-in attendees: 45
-    Tag: spring_2024_mixer_attended
+    First-time attendees: 12 (tag: spring_2024_mixer_first_attended)
+    Returning attendees: 33 (tag: spring_2024_mixer_attended)
   RSVP no-shows: 23
     Tag: spring_2024_mixer_rsvp_no_show
 
@@ -892,7 +895,7 @@ Groups to tag:
 MAILCHIMP TAGGING RESULTS
 ============================================================
 
-Attendees (tagged with '_attended'):
+Attendees (tagged with '_first_attended' or '_attended'):
   Total:               45
   Successfully upserted: 45
   Successfully tagged:   45
@@ -921,6 +924,7 @@ Overall Summary:
 
 ### Features
 
+- **First-Time vs Returning Differentiation**: Automatically tags first-time attendees separately from returning attendees using the `is_first_event` database field
 - **Dual Group Tagging**: Tags both attendees and no-shows by default for comprehensive email segmentation
 - **Flexible Control**: Use `--only-attendees` to maintain original behavior (attendees only)
 - **Automatic Contact Management**: Creates new Mailchimp contacts or updates existing ones
@@ -929,6 +933,14 @@ Overall Summary:
 - **Error Handling**: Logs warnings for individual failures without stopping the entire process
 - **Dry Run Mode**: Test database queries and see what would be tagged without making API calls
 - **Separate Statistics**: Shows detailed stats for both attendees and RSVP no-shows
+
+### Use Cases for First-Time vs Returning Attendee Tags
+
+- **Personalized Welcome Emails**: Send targeted onboarding emails to first-time attendees
+- **Engagement Tracking**: Measure which events attract new members vs retain existing ones
+- **Different Follow-Ups**: Send "Welcome!" emails to first-timers and "Thanks for coming back!" to returners
+- **Segmentation in Mailchimp**: Create audience segments for all first-time attendees across events
+- **Analytics**: Compare first-time vs returning attendance rates per event type
 
 ### Use Cases for RSVP No-Show Tagging
 
@@ -960,8 +972,8 @@ When the cron job detects a new event with attendance data:
 Step 4: Running single event analysis for newly imported events...
   Analyzing event ID: 123
   ✅ Event 123 analysis completed
-  Tagging attendees and RSVP no-shows in Mailchimp for event 123...
-  ✅ Event 123 Mailchimp tagging completed
+  Tagging attendees (first-time/returning) and RSVP no-shows in Mailchimp for event 123...
+  ✅ Event 123 Mailchimp tagging completed (12 first-time, 33 returning, 23 no-shows)
 ```
 
 ### Manual Usage
@@ -995,6 +1007,13 @@ python mailChimp/tag_mailchimp_attendees.py --event-id 123 --only-attendees
 - Some contacts may fail if they've previously unsubscribed
 - Check Mailchimp logs for specific error messages
 - The script will continue tagging other people even if some fail
+
+**For More Details:**
+See [MAILCHIMP_IMPROVEMENTS.md](MAILCHIMP_IMPROVEMENTS.md) for comprehensive documentation on:
+- How the first-time vs returning attendee differentiation works
+- Technical implementation details
+- Complete feature changelog and improvements
+- Troubleshooting common issues
 
 ---
 
@@ -1597,6 +1616,172 @@ Columns included:
 - Verify the event has a registration form with custom questions
 - Check that guests filled out the registration form
 - Empty/unanswered questions will appear as blank cells in the CSV
+
+---
+
+## Attendee List Export
+
+The `extra/export_attendee_list.py` script exports checked-in attendee lists from the PostgreSQL database to CSV format, including all registration form answers. This is similar to `export_guest_list.py`, but exports actual attendees (who checked in) rather than approved RSVPs from Luma.
+
+### Features
+
+- **Database-Driven**: Queries PostgreSQL database directly (not Luma API)
+- **Interactive Event Selection**: Choose from 5 most recent events
+- **Checked-In Attendees Only**: Filters for `checked_in = TRUE` in attendance table
+- **Complete Registration Data**: Exports all standard fields plus custom form answers from `additional_info` JSON
+- **Dynamic Columns**: Automatically discovers and includes all registration questions stored in database
+- **Same Format as Guest List**: Maintains consistency with `export_guest_list.py` output format
+
+### Setup
+
+Ensure your `.env` file includes database credentials:
+```bash
+PGHOST=your-database-host
+PGPORT=5432
+PGDATABASE=railway
+PGUSER=postgres
+PGPASSWORD=your-password
+```
+
+### Usage
+
+Run the script interactively:
+
+```bash
+python3 extra/export_attendee_list.py
+```
+
+**Step 1: View Recent Events**
+
+The script displays 5 most recent events from the database:
+```
+============================================================
+DATABASE ATTENDEE LIST EXPORTER
+============================================================
+
+Found 5 recent events:
+
+  1. CamelHack 2026 Demo Day
+     Date: 2026-03-08
+
+  2. CamelHack Kick Off
+     Date: 2026-03-07
+
+  3. Jon Hirschtick x CAMEL
+     Date: 2026-02-18
+
+Select an event (1-5):
+```
+
+**Step 2: Select Event**
+
+Enter the event number to export its attendee list.
+
+**Step 3: Automatic Export**
+
+The script will:
+1. Query all attendees from database where `checked_in = TRUE`
+2. Parse `additional_info` JSON for each attendee
+3. Extract all registration form answers
+4. Export to CSV in `test_output/` directory
+
+### Output
+
+**CSV Location**: `test_output/{event_name}_attendee_list.csv`
+
+**Columns Exported**:
+- `first_name` - Attendee's first name
+- `last_name` - Attendee's last name
+- `email` - Email address (coalesced from school_email/personal_email)
+- `phone_number` - Phone number
+- **All registration form questions** (from `additional_info` JSON)
+  - Example: "Gender"
+  - Example: "Grad year"
+  - Example: "School email (.edu)"
+  - Example: "What brings you to Camel?"
+  - Example: "What major are you?"
+  - Example: "What school clubs are you involved in?"
+
+### Example Output
+
+```
+Selected: Jon Hirschtick x CAMEL
+
+Fetching attendees...
+  Found 101 checked-in attendees
+
+Extracting attendee data...
+
+============================================================
+EXPORT COMPLETE
+============================================================
+Event: Jon Hirschtick x CAMEL
+Checked-in attendees exported: 101
+Output file: test_output/jon_hirschtick_x_camel_attendee_list.csv
+Columns: 10
+
+Columns included:
+  - first_name
+  - last_name
+  - email
+  - phone_number
+  - Gender
+  - Grad year
+  - School email (.edu)
+  - What brings you to Camel?
+  - What major are you?
+  - What school clubs are you involved in?
+============================================================
+```
+
+### Comparison: Guest List vs Attendee List
+
+| Feature | `export_guest_list.py` | `export_attendee_list.py` |
+|---------|------------------------|---------------------------|
+| **Data Source** | Luma API | PostgreSQL Database |
+| **Filter** | `approval_status == 'approved'` | `checked_in = TRUE` |
+| **People Included** | Approved RSVPs | Actual attendees who checked in |
+| **Custom Answers Source** | `registration_answers` array (Luma) | `additional_info` JSON (database) |
+| **Requires Database** | No | Yes |
+| **Requires Luma API** | Yes | No |
+| **Best For** | Pre-event planning, check-in lists | Post-event analysis, actual attendance |
+
+### Use Cases
+
+- **Post-Event Analysis**: Export actual attendees for follow-up surveys
+- **Attendance Records**: Create historical records of who actually attended
+- **Email Campaigns**: Target only people who showed up (higher engagement)
+- **Data Analysis**: Analyze demographics of actual attendees vs RSVPs
+- **Certificates/Recognition**: Generate certificates for attendees
+- **Event Reporting**: Report actual attendance with full registration data
+
+### Troubleshooting
+
+**No Events Found:**
+- Verify database connection is working
+- Check that events exist in the `events` table
+- Ensure `.env` has correct database credentials
+
+**Database Connection Errors:**
+- Verify all `PG*` environment variables are correct in `.env`
+- Check that the database is accessible
+- Ensure database credentials have SELECT permissions
+
+**No Attendees Found:**
+- Verify the event has attendees with `checked_in = TRUE`
+- Check that attendance data has been imported from Luma
+- Run `import_luma_attendance.py` if attendance data is missing
+
+**Missing Registration Columns:**
+- Verify `people.additional_info` JSON field is populated
+- Check that `import_luma_attendance.py` has been run to sync data
+- Some people may have empty `additional_info` if they registered before custom fields were added
+
+**Column Differences from Guest List:**
+- Attendee list uses `first_name`/`last_name` (database fields)
+- Guest list uses `user_first_name`/`user_last_name` (Luma fields)
+- Attendee list doesn't include `user_name` field (not stored in database)
+- Both formats include all custom registration questions
 
 ## Add Person to Database
 
