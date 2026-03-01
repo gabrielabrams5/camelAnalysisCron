@@ -36,7 +36,9 @@ RUN chmod +x /app/run_luma_pipeline.sh
 
 # Create cron job file
 # Run every 6 hours: 0 */6 * * * (or customize as needed)
-RUN echo "0 */6 * * * PATH=/usr/local/bin:/usr/bin:/bin cd /app && /bin/bash /app/run_luma_pipeline.sh >> /var/log/cron.log 2>&1" > /etc/cron.d/analytics-cron
+RUN echo "SHELL=/bin/bash" > /etc/cron.d/analytics-cron && \
+    echo "PATH=/usr/local/bin:/usr/bin:/bin" >> /etc/cron.d/analytics-cron && \
+    echo "0 */6 * * * cd /app && /bin/bash /app/run_luma_pipeline.sh >> /var/log/cron.log 2>&1" >> /etc/cron.d/analytics-cron
 
 # Give execution rights on the cron job
 RUN chmod 0644 /etc/cron.d/analytics-cron
