@@ -105,41 +105,41 @@ except:
     else
         echo "Warning: Placard generation encountered errors"
     fi
-else
+
+    # Step 6: Run comprehensive analytics
     echo ""
-    echo "Step 3: No events require attendance import (skipping)"
-fi
+    echo "Step 6: Running comprehensive analytics..."
+    python3 "$SCRIPT_DIR/analyze.py" --outdir "$SCRIPT_DIR/analysis_outputs"
 
-# Step 6: Run comprehensive analytics (always run this)
-echo ""
-echo "Step 6: Running comprehensive analytics..."
-python3 "$SCRIPT_DIR/analyze.py" --outdir "$SCRIPT_DIR/analysis_outputs"
-
-if [ $? -eq 0 ]; then
-    echo "Analytics completed successfully"
-else
-    echo "Warning: Analytics encountered errors"
-fi
-
-# Step 7: Sync Mailchimp audience (if credentials are configured)
-echo ""
-echo "Step 7: Syncing Mailchimp audience..."
-
-# Check if Mailchimp credentials are configured
-if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
-    set +e  # Temporarily allow non-zero exit codes
-    python3 "$SCRIPT_DIR/mailChimp/sync_mailchimp_audience.py"
-    mailchimp_exit_code=$?
-    set -e  # Re-enable exit on error
-
-    if [ $mailchimp_exit_code -eq 0 ]; then
-        echo "Mailchimp audience sync completed successfully"
+    if [ $? -eq 0 ]; then
+        echo "Analytics completed successfully"
     else
-        echo "Warning: Mailchimp audience sync encountered errors"
+        echo "Warning: Analytics encountered errors"
+    fi
+
+    # Step 7: Sync Mailchimp audience (if credentials are configured)
+    echo ""
+    echo "Step 7: Syncing Mailchimp audience..."
+
+    # Check if Mailchimp credentials are configured
+    if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
+        set +e  # Temporarily allow non-zero exit codes
+        python3 "$SCRIPT_DIR/mailChimp/sync_mailchimp_audience.py"
+        mailchimp_exit_code=$?
+        set -e  # Re-enable exit on error
+
+        if [ $mailchimp_exit_code -eq 0 ]; then
+            echo "Mailchimp audience sync completed successfully"
+        else
+            echo "Warning: Mailchimp audience sync encountered errors"
+        fi
+    else
+        echo "Mailchimp credentials not configured - skipping audience sync"
+        echo "(Set MAILCHIMP_API_KEY, MAILCHIMP_SERVER_PREFIX, and MAILCHIMP_AUDIENCE_ID to enable)"
     fi
 else
-    echo "Mailchimp credentials not configured - skipping audience sync"
-    echo "(Set MAILCHIMP_API_KEY, MAILCHIMP_SERVER_PREFIX, and MAILCHIMP_AUDIENCE_ID to enable)"
+    echo ""
+    echo "Step 3: No events require attendance import (skipping steps 3-7)"
 fi
 
 echo ""
