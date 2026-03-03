@@ -34,19 +34,8 @@ RUN chmod +x /app/entrypoint.py
 # Make pipeline script executable
 RUN chmod +x /app/run_luma_pipeline.sh
 
-# Create cron job file
-# Run every 6 hours: 0 */6 * * * (or customize as needed)
-RUN echo "SHELL=/bin/bash" > /etc/cron.d/analytics-cron && \
-    echo "PATH=/usr/local/bin:/usr/bin:/bin" >> /etc/cron.d/analytics-cron && \
-    echo "0 */6 * * * cd /app && /bin/bash /app/run_luma_pipeline.sh >> /var/log/cron.log 2>&1" >> /etc/cron.d/analytics-cron
-
-# Give execution rights on the cron job
-RUN chmod 0644 /etc/cron.d/analytics-cron
-
-# Apply cron job
-RUN crontab /etc/cron.d/analytics-cron
-
 # Create the log file to be able to run tail
+# Note: Crontab is generated dynamically by entrypoint.py with environment variables
 RUN touch /var/log/cron.log
 
 # Run the entrypoint script
