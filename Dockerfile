@@ -17,6 +17,7 @@ COPY luma_sync.py .
 COPY import_luma_attendance.py .
 COPY event_analysis_single.py .
 COPY generate_all_placards.py .
+COPY transform_to_placard_csv.py .
 COPY run_luma_pipeline.sh .
 
 # Copy directories

@@ -650,6 +650,65 @@ When using `--customize`, you'll see prompts like this:
 
 ---
 
+### Downloading Placards from Database
+
+The `extra/download_placards.py` script downloads all placard PDFs stored in the Railway database and saves them to local files.
+
+**Usage:**
+
+```bash
+# Download all placards from database
+python3 extra/download_placards.py
+```
+
+**What It Does:**
+
+1. Connects to the Railway PostgreSQL database
+2. Queries all events where `placard_pdf IS NOT NULL`
+3. Downloads each PDF from the database (BYTEA column)
+4. Saves PDFs to `extra/placards/` directory
+5. Uses filename format: `event_{id}_{sanitized_event_name}.pdf`
+6. Shows progress with file sizes and summary count
+
+**Output:**
+
+- **Location**: `extra/placards/`
+- **Filename format**: `event_123_Spring_Networking_Night.pdf`
+- **Git-ignored**: PDFs in this directory are automatically excluded from version control via `.gitignore`
+
+**Example Output:**
+
+```
+Downloading 15 placard(s) to /path/to/extra/placards/
+
+✓ Downloaded: event_120_CamelHack_2026_Demo_Day.pdf (234.5 KB)
+✓ Downloaded: event_121_Jon_Hirschtick_x_CAMEL.pdf (198.3 KB)
+✓ Downloaded: event_122_Spring_Networking_Night.pdf (215.7 KB)
+...
+
+Successfully downloaded 15/15 placard(s)
+```
+
+**Prerequisites:**
+- PostgreSQL database connection configured in `.env`
+- Python dependencies installed (`psycopg2`)
+- Placards must be generated first using `generate_all_placards.py`
+
+**Features:**
+- **Automatic directory creation**: Creates `extra/placards/` if it doesn't exist
+- **Safe filenames**: Sanitizes event names for filesystem compatibility
+- **Progress tracking**: Shows each download with file size
+- **Error handling**: Continues downloading even if individual files fail
+- **Git protection**: PDFs are automatically excluded from commits via `.gitignore`
+
+**Use Cases:**
+- **Local backup**: Keep local copies of all generated placards
+- **Offline access**: Access placards without database connection
+- **Distribution**: Share placard PDFs with team members
+- **Archive**: Maintain historical records of event placards
+
+---
+
 ### Event 24 Additional Questions Analysis
 
 The `feedback/event24_additional_questions.py` script analyzes custom registration questions for Event 24 (Jon Hirschtick x CAMEL / Solidworks event), providing detailed insights into attendee responses with attendance cross-reference and demographics breakdown.
@@ -1912,6 +1971,208 @@ Last name (press Enter to skip): Smith
 **Duplicate Email:**
 - If duplicate is found, no insertion occurs
 - You can update the existing person record through the database if needed
+
+## Merge Duplicate People
+
+The `extra/merge_duplicate_people.py` script finds and merges duplicate people records in the database based on matching identifiers (email addresses or phone numbers). This is useful for cleaning up the database when the same person has been registered multiple times with slight variations in their information.
+
+### Features
+
+- **Smart Duplicate Detection**: Identifies people who share the same `school_email`, `personal_email`, or `phone_number`
+- **Connected Component Analysis**: Groups together all people connected through any shared identifier (e.g., if Person A shares email with Person B, and Person B shares phone with Person C, all three are grouped together)
+- **Interactive Merging**: Shows detailed information for each duplicate group and prompts for confirmation before merging
+- **Data Preservation**: Combines the best non-NULL values from all duplicate records
+- **Relationship Updates**: Automatically reassigns all related records (attendance, promo codes, event feedback) to the primary person
+- **Safe Operations**: Uses database transactions with rollback on error
+- **Dry Run Mode**: Preview what would be merged without making any changes
+
+### Setup
+
+Ensure your `.env` file includes database credentials:
+```bash
+PGHOST=your-database-host
+PGPORT=5432
+PGDATABASE=railway
+PGUSER=postgres
+PGPASSWORD=your-password
+```
+
+### Usage
+
+**Preview duplicates without making changes (recommended first run):**
+```bash
+python3 extra/merge_duplicate_people.py --dry-run
+```
+
+**Interactive merge with confirmation prompts:**
+```bash
+python3 extra/merge_duplicate_people.py
+```
+
+### How It Works
+
+#### Duplicate Detection Strategy
+
+The script finds groups of people who share any of these identifiers:
+- **School email**: Same `school_email` value (case-insensitive)
+- **Personal email**: Same `personal_email` value (case-insensitive)
+- **Phone number**: Same `phone_number` value
+
+**Connected components**: If Person A shares an email with Person B, and Person B shares a phone number with Person C, all three are considered duplicates and grouped together.
+
+#### Merging Strategy
+
+For each duplicate group:
+1. **Primary record**: Keeps the person with the lowest ID (oldest record)
+2. **Data merging**: For each field, uses the first non-NULL value found across all duplicates
+3. **Related records**: Updates all references in these tables to point to the primary record:
+   - `attendance.person_id`
+   - `promo_codes.person_id`
+   - `event_feedback.person_id`
+4. **Deletion**: Removes duplicate person records after reassigning their data
+5. **Count recalculation**: Updates `event_attendance_count` for the merged person
+
+### Interactive Example
+
+```
+================================================================================
+DUPLICATE GROUP FOUND (2 records)
+================================================================================
+  Record 1 [PRIMARY - lowest ID]:
+    ID: 1928
+    Name: Gabriel Barnes
+    Class Year: None
+    School Email: gabrielabrams@college.harvard.edu
+    Personal Email: gabrielabrams99@gmail.com
+    Preferred Email: gabrielabrams@college.harvard.edu
+    Phone: None
+    School: None
+    Gender: None
+    Is Jewish: None
+    Event Attendance: 0
+    Event RSVPs: 0
+    Related records: 4 attendance, 0 promo codes, 0 feedback
+
+  Record 2:
+    ID: 2123
+    Name: Gabriel Abrams
+    Class Year: None
+    School Email: None
+    Personal Email: gabrielabrams100@gmail.com
+    Preferred Email: gabrielabrams100@gmail.com
+    Phone: None
+    School: None
+    Gender: None
+    Is Jewish: None
+    Event Attendance: 0
+    Event RSVPs: 0
+    Related records: 0 attendance, 0 promo codes, 0 feedback
+
+--------------------------------------------------------------------------------
+MERGED RECORD (combining non-NULL values):
+    ID: 1928
+    Name: Gabriel Barnes
+    Class Year: None
+    School Email: gabrielabrams@college.harvard.edu
+    Personal Email: gabrielabrams99@gmail.com
+    Preferred Email: gabrielabrams@college.harvard.edu
+    Phone: None
+    School: None
+    Gender: None
+    Is Jewish: None
+    Event Attendance: 0
+    Event RSVPs: 0
+--------------------------------------------------------------------------------
+
+Total related records to merge:
+  - 4 attendance records
+  - 0 promo code records
+  - 0 event feedback records
+
+Duplicate records to delete: 1
+
+Merge these records? [y/N]: y
+
+✓ Successfully merged 2 records into ID 1928
+```
+
+### Command-line Arguments
+
+| Argument | Description | Required |
+|----------|-------------|----------|
+| `--dry-run` | Show what would be merged without making database changes | No |
+
+### Output Summary
+
+After processing all duplicate groups, you'll see:
+```
+================================================================================
+SUMMARY
+================================================================================
+Total duplicate groups found: 5
+Merged: 3
+Skipped: 2
+================================================================================
+```
+
+### Use Cases
+
+- **Name Typos**: Merge records where names were spelled differently ("Gabriel Barnes" vs "Gabriel Abrams")
+- **Multiple Registrations**: Combine records when someone registered for different events with different emails
+- **Data Quality**: Clean up the database by removing duplicate entries
+- **Contact Consolidation**: Ensure each person has only one record with complete information
+- **Pre-Analysis Cleanup**: Run before generating analytics to ensure accurate attendance counts
+
+### Common Scenarios
+
+**Scenario 1: Same person, different emails**
+- Person registered for Event 1 with `student@college.harvard.edu`
+- Same person registered for Event 2 with `student.name@gmail.com`
+- Script merges both records, preserving both email addresses
+
+**Scenario 2: Phone number match**
+- Two records with different names but same phone number
+- Script identifies them as potential duplicates
+- You review and confirm if they're the same person
+
+**Scenario 3: Connected duplicates**
+- Person A and B share email `john@harvard.edu`
+- Person B and C share phone `(555) 123-4567`
+- All three are grouped together for merging
+
+### Troubleshooting
+
+**No Duplicates Found:**
+- This is good! Your database is clean
+- Double-check by looking for similar names or email patterns manually
+
+**Too Many False Positives:**
+- The script may group people who genuinely share phones (e.g., family members)
+- Use interactive mode and carefully review each group before confirming
+- Choose "N" to skip merging groups that aren't truly duplicates
+
+**Merge Failed:**
+- Check database logs for specific error messages
+- Ensure database credentials have UPDATE and DELETE permissions
+- The transaction will roll back automatically, leaving the database unchanged
+
+**Data Loss Concerns:**
+- The script only keeps non-NULL values, so no data is lost
+- Primary record (lowest ID) is always preserved
+- All related records (attendance, promo codes, feedback) are reassigned, not deleted
+- Use `--dry-run` first to preview changes without risk
+
+**Database Connection Errors:**
+- Verify all `PG*` environment variables are correct in `.env`
+- Check that the database is accessible
+- Ensure database credentials have proper permissions
+
+### Important Notes
+
+- **Backup first**: Consider backing up your database before running merge operations
+- **Review carefully**: Always review the merged record preview before confirming
+- **Irreversible**: Once merged and confirmed, the duplicate records are deleted (though their data lives on in the primary record)
+- **Attendance preserved**: All attendance records are moved to the primary person, so event counts remain accurate
 
 ## License
 
