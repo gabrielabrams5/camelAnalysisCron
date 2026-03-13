@@ -522,6 +522,9 @@ python event_analysis_single.py --event-id 123 --outdir ./reports
 
 # Custom output filename
 python event_analysis_single.py --event-id 123 --output-file custom_analysis.csv
+
+# Manual retention calculation - choose 4 past events for retention metrics
+python event_analysis_single.py --event-id 45 --choose-past
 ```
 
 **Command-line Arguments:**
@@ -529,8 +532,52 @@ python event_analysis_single.py --event-id 123 --output-file custom_analysis.csv
 | Argument | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `--event-id` | Event ID to analyze (omit for interactive mode) | None | No |
+| `--choose-past` | Manually select 4 past events for retention calculation (requires `--event-id`) | Disabled | No |
 | `--outdir` | Output directory for CSV file | `.` (current directory) | No |
 | `--output-file` | Output CSV filename | `event_analysis_all.csv` | No |
+
+**Manual Retention Selection (`--choose-past`):**
+
+The `--choose-past` flag allows you to manually select which 4 events to use for retention calculation instead of automatically using the most recent events by datetime. This is useful when you want to compare a current event to specific past events.
+
+**How it works:**
+1. Displays the past 15 events (most recent first)
+2. Prompts you to enter up to 4 event IDs (comma-separated, e.g., `42,39,37,35`)
+3. Analyzes the event specified by `--event-id`
+4. Uses your selected events for retention metrics (i-1, i-2, i-3, i-4)
+5. Uses the **first event ID** in your list for comparison metrics (RSVPs/attendees/first timers % change)
+
+**Example:**
+```bash
+# Analyze event 45, manually choosing retention events
+python event_analysis_single.py --event-id 45 --choose-past
+
+# You'll see:
+# === SELECT PAST EVENTS TO ANALYZE ===
+# (Select up to 4 events by entering event IDs separated by commas, e.g., 42,41,38)
+#
+# ID    Name                                              Date                 Category        Attendance
+# ======================================================================================================
+# 42    Winter Formal Dance                               2024-12-15 19:00     party           120
+# 41    Tech Panel Discussion                             2024-12-10 18:30     talk            45
+# ...
+#
+# Enter event IDs (max 4, comma-separated): 42,39,37,35
+#
+# Selected 4 event(s) for retention calculation.
+# Analyzing event ID: 45
+```
+
+**Benefits:**
+- Compare to specific event types (e.g., only compare parties to parties)
+- Exclude outlier events from retention calculations
+- Manual control over which events matter for analysis
+- Consistent comparison across different event analyses
+
+**Notes:**
+- Event names in retention columns are automatically truncated to 3 words to prevent display issues
+- The 4 selected events are automatically sorted by datetime to determine i-1, i-2, i-3, i-4 order
+- Only 1 row is added to the CSV (for the event specified by `--event-id`)
 
 **What It Does:**
 

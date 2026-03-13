@@ -393,7 +393,49 @@ def should_approve_rsvp(person, guest_data, event_start_datetime):
             if check_approved_email(person.get('personal_email')):
                 return (True, f"event in {hours_until_event:.1f}h + Harvard/MIT email (DB)")
 
-    return (False, "does not meet criteria")
+    # Build detailed rejection message for verbose mode
+    rejection_parts = []
+
+    # Part 1: Database status
+    if person:
+        matched_by = person.get('matched_by', 'unknown')
+        rejection_parts.append(f"found in DB (matched by {matched_by})")
+    else:
+        rejection_parts.append("not in DB")
+
+    # Part 2: Attendance status
+    if person:
+        attendance_count = person.get('attendance_count', 0)
+        if attendance_count < 2:
+            rejection_parts.append(f"{attendance_count} event{'s' if attendance_count != 1 else ''} (needs 2+)")
+    else:
+        rejection_parts.append("0 events (needs 2+)")
+
+    # Part 3: Event timing
+    rejection_parts.append(f"event in {hours_until_event:.1f}h (needs ≤24h for Harvard/MIT approval)")
+
+    # Part 4: Email check results
+    email_checks = []
+    main_email = guest_data.get('email') or ''
+    school_email_field = get_registration_answer(guest_data, 'School email (.edu)')
+
+    if main_email:
+        email_checks.append(f"main: {main_email}")
+    if school_email_field:
+        email_checks.append(f"school: {school_email_field}")
+    if person:
+        if person.get('school_email'):
+            email_checks.append(f"DB school: {person.get('school_email')}")
+        if person.get('personal_email'):
+            email_checks.append(f"DB personal: {person.get('personal_email')}")
+
+    if email_checks:
+        rejection_parts.append(f"checked emails: {', '.join(email_checks)} - no Harvard/MIT match")
+    else:
+        rejection_parts.append("no emails to check")
+
+    detailed_reason = " | ".join(rejection_parts)
+    return (False, detailed_reason)
 
 
 def approve_guest(event_api_id, guest_email, dry_run=False):

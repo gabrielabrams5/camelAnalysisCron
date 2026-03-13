@@ -57,6 +57,87 @@ def display_events(conn):
     return events_df
 
 
+def display_past_events(conn, limit=15):
+    """
+    Display past events for selection.
+    Returns a list of events ordered by datetime (most recent first).
+    """
+    query = """
+    SELECT id, event_name, start_datetime, category, attendance
+    FROM events
+    ORDER BY start_datetime DESC
+    LIMIT %s
+    """
+
+    events_df = pd.read_sql(query, conn, params=(limit,))
+
+    print("\n=== SELECT PAST EVENTS TO ANALYZE ===")
+    print("(Select up to 4 events by entering event IDs separated by commas, e.g., 42,41,38)\n")
+    print(f"{'ID':<5} {'Name':<50} {'Date':<20} {'Category':<15} {'Attendance':<10}")
+    print("=" * 105)
+
+    events_list = []
+    for _, row in events_df.iterrows():
+        date_str = row['start_datetime'].strftime('%Y-%m-%d %H:%M') if pd.notna(row['start_datetime']) else 'N/A'
+        attendance = row['attendance'] if pd.notna(row['attendance']) else 0
+        category = row['category'] if pd.notna(row['category']) else 'N/A'
+        print(f"{row['id']:<5} {row['event_name'][:48]:<50} {date_str:<20} {category:<15} {int(attendance):<10}")
+        events_list.append(row)
+
+    print("\n")
+    return events_list
+
+
+def get_user_event_selection(events_list):
+    """
+    Prompt user to select up to 4 events from the list by event ID.
+    Returns a list of selected event IDs.
+    """
+    max_selections = 4
+    available_event_ids = [row['id'] for row in events_list]
+
+    while True:
+        try:
+            user_input = input(f"Enter event IDs (max {max_selections}, comma-separated): ").strip()
+
+            # Parse comma-separated input
+            selections = [s.strip() for s in user_input.split(',')]
+
+            # Convert to integers
+            selected_event_ids = []
+            for s in selections:
+                try:
+                    event_id = int(s)
+                    selected_event_ids.append(event_id)
+                except ValueError:
+                    print(f"Error: '{s}' is not a valid number. Please try again.")
+                    raise ValueError()
+
+            # Check for duplicates
+            if len(selected_event_ids) != len(set(selected_event_ids)):
+                print("Error: Duplicate selections detected. Please select unique events.")
+                continue
+
+            # Validate that event IDs exist in the displayed list
+            invalid_ids = [eid for eid in selected_event_ids if eid not in available_event_ids]
+            if invalid_ids:
+                print(f"Error: Event ID(s) {invalid_ids} not found in the displayed list. Please select from available events.")
+                continue
+
+            # Check max selections
+            if len(selected_event_ids) > max_selections:
+                print(f"Error: You can select a maximum of {max_selections} events. You selected {len(selected_event_ids)}.")
+                continue
+
+            return selected_event_ids
+
+        except ValueError:
+            continue
+        except (KeyboardInterrupt, EOFError):
+            print("\nSelection cancelled.")
+            return None
+
+
 def calculate_academic_year_cutoff(event_date):
     """
     Calculate the class year cutoff for underclassmen.
@@ -299,7 +380,7 @@ def calculate_retention_rates(conn, current_event_id):
         prev_event_id, prev_event_name, prev_event_datetime = previous_events[idx]
 
         # Store event name and date
-        retention[f'event_name_i_minus_{offset}'] = prev_event_name
+        retention[f'event_name_i_minus_{offset}'] = truncate_event_name(prev_event_name)
         retention[f'event_date_i_minus_{offset}'] = prev_event_datetime
 
         # Get previous event attendees
@@ -331,6 +412,114 @@ def calculate_retention_rates(conn, current_event_id):
     return retention
 
 
+def calculate_retention_rates_manual(conn, current_event_id, selected_event_ids):
+    """
+    Calculate retention rates from manually selected events.
+
+    Args:
+        conn: Database connection
+        current_event_id: ID of the event being analyzed
+        selected_event_ids: List of 4 event IDs to use for retention calculation
+
+    For each of the selected events (ordered as i-1, i-2, i-3, i-4):
+    - % of attendees who also attended current event
+    - % of first timers who also attended current event
+    - Event name and date
+    """
+    retention = {}
+
+    # Get current event attendees
+    current_attendees_query = """
+    SELECT person_id
+    FROM attendance
+    WHERE event_id = %s AND checked_in = TRUE
+    """
+    current_attendees = pd.read_sql(current_attendees_query, conn, params=(current_event_id,))
+    current_attendee_ids = set(current_attendees['person_id'].tolist())
+
+    # Get event info for selected events and sort by datetime
+    cursor = conn.cursor()
+    placeholders = ','.join(['%s'] * len(selected_event_ids))
+    cursor.execute(f"""
+        SELECT id, event_name, start_datetime
+        FROM events
+        WHERE id IN ({placeholders})
+        ORDER BY start_datetime DESC
+    """, tuple(selected_event_ids))
+
+    sorted_events = cursor.fetchall()
+    cursor.close()
+
+    # Process each selected event (i-1, i-2, i-3, i-4)
+    for offset in range(1, 5):
+        idx = offset - 1  # Convert to 0-based index
+
+        # Check if we have an event at this offset
+        if idx >= len(sorted_events):
+            # No more events
+            retention[f'return_rate_i_minus_{offset}'] = None
+            retention[f'first_timer_return_rate_i_minus_{offset}'] = None
+            retention[f'event_name_i_minus_{offset}'] = None
+            retention[f'event_date_i_minus_{offset}'] = None
+            continue
+
+        # Get event info from the sorted list
+        prev_event_id, prev_event_name, prev_event_datetime = sorted_events[idx]
+
+        # Store event name and date
+        retention[f'event_name_i_minus_{offset}'] = truncate_event_name(prev_event_name)
+        retention[f'event_date_i_minus_{offset}'] = prev_event_datetime
+
+        # Get previous event attendees
+        prev_attendees_query = """
+        SELECT person_id, is_first_event
+        FROM attendance
+        WHERE event_id = %s AND checked_in = TRUE
+        """
+        prev_attendees = pd.read_sql(prev_attendees_query, conn, params=(prev_event_id,))
+
+        if prev_attendees.empty:
+            retention[f'return_rate_i_minus_{offset}'] = None
+            retention[f'first_timer_return_rate_i_minus_{offset}'] = None
+            continue
+
+        # Calculate return rate for all attendees
+        prev_attendee_ids = set(prev_attendees['person_id'].tolist())
+        returned = len(current_attendee_ids & prev_attendee_ids)
+        total_prev = len(prev_attendee_ids)
+        retention[f'return_rate_i_minus_{offset}'] = (returned / total_prev * 100) if total_prev > 0 else 0
+
+        # Calculate return rate for first timers only
+        first_timers = prev_attendees[prev_attendees['is_first_event'] == True]
+        first_timer_ids = set(first_timers['person_id'].tolist())
+        first_timers_returned = len(current_attendee_ids & first_timer_ids)
+        total_first_timers = len(first_timer_ids)
+        retention[f'first_timer_return_rate_i_minus_{offset}'] = (first_timers_returned / total_first_timers * 100) if total_first_timers > 0 else 0
+
+    return retention
+
+
+def truncate_event_name(event_name, max_words=3):
+    """
+    Truncate event name to first N words.
+
+    Args:
+        event_name: Full event name
+        max_words: Maximum number of words to keep (default: 3)
+
+    Returns:
+        Truncated event name
+    """
+    if not event_name:
+        return event_name
+
+    words = event_name.split()
+    if len(words) <= max_words:
+        return event_name
+
+    return ' '.join(words[:max_words])
+
+
 def calculate_percent_change(current, previous):
     """Calculate percentage change between two values."""
     if previous is None or previous == 0:
@@ -345,9 +534,14 @@ def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Single Event Analysis')
     parser.add_argument('--event-id', type=int, help='Event ID to analyze (for automated mode)')
+    parser.add_argument('--choose-past', action='store_true', help='Interactively select 4 past events for retention calculation (requires --event-id)')
     parser.add_argument('--outdir', type=str, default='.', help='Output directory for CSV file')
     parser.add_argument('--output-file', type=str, default='event_analysis_all.csv', help='Output CSV filename (default: event_analysis_all.csv)')
     args = parser.parse_args()
+
+    # Validate arguments
+    if args.choose_past and not args.event_id:
+        parser.error("--choose-past requires --event-id to specify which event to analyze")
 
     print("=== Single Event Analysis ===\n")
 
@@ -356,13 +550,30 @@ def main():
     conn = connect_to_db()
     print("Connected!\n")
 
-    # Get event ID - either from args or interactively
-    if args.event_id:
+    # Get event ID and optionally manual retention events
+    selected_retention_event_ids = None
+
+    if args.choose_past:
+        # Manual retention mode: select 4 events for retention calculation
+        events_list = display_past_events(conn, limit=15)
+        selected_retention_event_ids = get_user_event_selection(events_list)
+
+        if selected_retention_event_ids is None:
+            print("No events selected. Exiting.")
+            conn.close()
+            return
+
+        print(f"\nSelected {len(selected_retention_event_ids)} event(s) for retention calculation.")
+        event_id = args.event_id
+        print(f"Analyzing event ID: {event_id}\n")
+
+    elif args.event_id:
         # Automated mode
         event_id = args.event_id
         print(f"Analyzing event ID: {event_id} (automated mode)\n")
+
     else:
-        # Interactive mode
+        # Interactive mode - single event
         # Display events
         events_df = display_events(conn)
 
@@ -379,6 +590,11 @@ def main():
 
         print(f"\nAnalyzing event {event_id}...\n")
 
+    # Set up output path
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    output_path = outdir / args.output_file
+
     # Get metrics for current event
     current_metrics = get_event_metrics(conn, event_id)
 
@@ -387,13 +603,24 @@ def main():
         conn.close()
         return
 
-    # Get metrics for previous event (by datetime, not ID)
-    previous_events = get_previous_events_by_datetime(conn, event_id, limit=1)
-    prev_event_id = previous_events[0][0] if previous_events else None
-    prev_metrics = get_event_metrics(conn, prev_event_id) if prev_event_id else None
+    # Get metrics for previous event
+    if selected_retention_event_ids is not None:
+        # Use first selected event as previous event for comparison
+        prev_event_id = selected_retention_event_ids[0]
+        prev_metrics = get_event_metrics(conn, prev_event_id)
+    else:
+        # Auto-find previous event by datetime
+        previous_events = get_previous_events_by_datetime(conn, event_id, limit=1)
+        prev_event_id = previous_events[0][0] if previous_events else None
+        prev_metrics = get_event_metrics(conn, prev_event_id) if prev_event_id else None
 
     # Calculate retention rates
-    retention = calculate_retention_rates(conn, event_id)
+    if selected_retention_event_ids is not None:
+        # Use manually selected events for retention
+        retention = calculate_retention_rates_manual(conn, event_id, selected_retention_event_ids)
+    else:
+        # Auto-find previous events for retention
+        retention = calculate_retention_rates(conn, event_id)
 
     # Build output row
     output = {
@@ -448,11 +675,6 @@ def main():
     # Create DataFrame and save to CSV
     output_df = pd.DataFrame([output])
 
-    # Format the output filename with outdir
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    output_path = outdir / args.output_file
-
     # Check if file exists to determine append mode
     file_exists = output_path.exists()
 
@@ -464,13 +686,13 @@ def main():
         index=False
     )
 
+    # Display summary
     print(f"✅ Analysis complete!")
     if file_exists:
         print(f"📊 Output appended to: {output_path.resolve()}")
     else:
         print(f"📊 Output saved to: {output_path.resolve()}")
 
-    # Display summary
     print("\n=== SUMMARY ===")
     print(f"Event: {current_metrics['event_name']} (ID: {event_id})")
     print(f"Date: {current_metrics['event_date']}")
