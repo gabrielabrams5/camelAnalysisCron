@@ -42,6 +42,9 @@ def get_event24_data(conn):
     Returns:
         DataFrame with person data, attendance status, and additional_info
     """
+    # Prefer the per-event snapshot on attendance.additional_info; fall back
+    # to people.additional_info for registrations imported before per-event
+    # snapshots existed.
     query = """
         SELECT
             e.id as event_id,
@@ -53,7 +56,7 @@ def get_event24_data(conn):
             p.gender,
             p.class_year,
             p.school,
-            p.additional_info,
+            COALESCE(a.additional_info, p.additional_info::jsonb) AS additional_info,
             a.rsvp,
             a.checked_in,
             a.approved

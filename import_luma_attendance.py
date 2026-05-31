@@ -638,13 +638,10 @@ def create_person(cursor, row_data):
         row_data: Dictionary with person data
     Returns: person_id
     """
-    import json
-
-    # Convert additional_info dict to JSON string if present
-    additional_info_json = None
-    if row_data.get('additional_info'):
-        additional_info_json = json.dumps(row_data['additional_info'])
-
+    # additional_info is intentionally not written to people. Registration
+    # answers are per-event snapshots and live on attendance.additional_info
+    # so cross-event aggregation can use the answer each person gave at the
+    # time of each registration, not just their most-recent answer.
     cursor.execute("""
         INSERT INTO people (
             first_name,
@@ -652,9 +649,8 @@ def create_person(cursor, row_data):
             gender,
             class_year,
             school,
-            preferred_name,
-            additional_info
-        ) VALUES (%s, %s, %s, %s, %s, NULL, %s)
+            preferred_name
+        ) VALUES (%s, %s, %s, %s, %s, NULL)
         RETURNING id
     """, (
         row_data['first_name'],
@@ -662,7 +658,6 @@ def create_person(cursor, row_data):
         row_data['gender'],
         row_data['class_year'],
         row_data['school'],
-        additional_info_json
     ))
 
     person_id = cursor.fetchone()[0]
@@ -676,24 +671,21 @@ def update_contact_info(cursor, person_id, row_data):
     Only updates fields that are currently NULL
     From raw_csv_to_sql.py logic
 
+    Note: additional_info is no longer written to people. Per-event
+    registration answers are stored on attendance.additional_info instead,
+    so historical Event X answers are preserved when the same person
+    registers for Event Y.
+
     Returns:
         bool: True if any contact info was updated, False otherwise
     """
-    import json
-
     school_email = row_data.get('school_email')
     personal_email = row_data.get('personal_email')
     phone = row_data.get('phone')
-    additional_info = row_data.get('additional_info')
-
-    # Convert additional_info dict to JSON string if present
-    additional_info_json = None
-    if additional_info:
-        additional_info_json = json.dumps(additional_info)
 
     # Check current values before update
     cursor.execute("""
-        SELECT school_email, personal_email, phone_number, additional_info
+        SELECT school_email, personal_email, phone_number
         FROM people
         WHERE id = %s
     """, (person_id,))
@@ -702,7 +694,7 @@ def update_contact_info(cursor, person_id, row_data):
     if not current:
         return False
 
-    current_school_email, current_personal_email, current_phone, current_additional_info = current
+    current_school_email, current_personal_email, current_phone = current
 
     # Update contact info
     cursor.execute("""
@@ -710,10 +702,9 @@ def update_contact_info(cursor, person_id, row_data):
         SET
             school_email = COALESCE(school_email, %s),
             personal_email = COALESCE(personal_email, %s),
-            phone_number = COALESCE(phone_number, %s),
-            additional_info = COALESCE(additional_info, %s)
+            phone_number = COALESCE(phone_number, %s)
         WHERE id = %s
-    """, (school_email, personal_email, phone, additional_info_json, person_id))
+    """, (school_email, personal_email, phone, person_id))
 
     # Check if any field was updated (was NULL and now has a value)
     updated = False
@@ -722,8 +713,6 @@ def update_contact_info(cursor, person_id, row_data):
     if current_personal_email is None and personal_email is not None:
         updated = True
     if current_phone is None and phone is not None:
-        updated = True
-    if current_additional_info is None and additional_info_json is not None:
         updated = True
 
     return updated
@@ -936,11 +925,19 @@ def create_attendance_record(cursor, person_id, event_id, guest_data):
         except:
             rsvp_datetime = None
 
+    # Per-event snapshot of registration answers. Lives on attendance (not
+    # people) so each event preserves the answer this person gave at the
+    # time of that registration.
+    registration_answers = get_all_registration_answers(guest_data)
+    additional_info_json = json.dumps(registration_answers) if registration_answers else None
+
     # Get or create invite token
     invite_token_id = find_or_create_invite_token(cursor, event_id, tracking_link)
 
     # Insert or update attendance record
-    # ON CONFLICT DO UPDATE allows re-importing to update checked_in and other status changes
+    # ON CONFLICT DO UPDATE allows re-importing to update checked_in and other status changes.
+    # additional_info is COALESCEd so re-imports preserve the original registration snapshot
+    # rather than overwriting it with a (potentially edited) later version.
     cursor.execute("""
         INSERT INTO attendance (
             person_id,
@@ -950,14 +947,16 @@ def create_attendance_record(cursor, person_id, event_id, guest_data):
             checked_in,
             rsvp_datetime,
             is_first_event,
-            invite_token_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, FALSE, %s)
+            invite_token_id,
+            additional_info
+        ) VALUES (%s, %s, %s, %s, %s, %s, FALSE, %s, %s)
         ON CONFLICT (person_id, event_id) DO UPDATE SET
             rsvp = EXCLUDED.rsvp,
             approved = EXCLUDED.approved,
             checked_in = EXCLUDED.checked_in,
             rsvp_datetime = EXCLUDED.rsvp_datetime,
-            invite_token_id = EXCLUDED.invite_token_id
+            invite_token_id = EXCLUDED.invite_token_id,
+            additional_info = COALESCE(attendance.additional_info, EXCLUDED.additional_info)
     """, (
         person_id,
         event_id,
@@ -965,7 +964,8 @@ def create_attendance_record(cursor, person_id, event_id, guest_data):
         approved,
         checked_in,
         rsvp_datetime,
-        invite_token_id
+        invite_token_id,
+        additional_info_json
     ))
 
     # Update is_first_event flag if this person checked in
@@ -1151,6 +1151,22 @@ def process_event_json(event_id, json_path, event_name, log_people=False):
             pass
 
 
+def ensure_schema(conn):
+    """
+    Idempotently ensure the attendance.additional_info column exists.
+    Lets the cron job self-heal on first run after the schema change,
+    so the operator does not have to remember to run a separate migration.
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "ALTER TABLE attendance ADD COLUMN IF NOT EXISTS additional_info JSONB"
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+
+
 def main():
     """Main entry point"""
     # Parse command line arguments
@@ -1163,6 +1179,12 @@ def main():
         help='Print detailed person information as each guest is processed'
     )
     args = parser.parse_args()
+
+    schema_conn = get_db_connection()
+    try:
+        ensure_schema(schema_conn)
+    finally:
+        schema_conn.close()
 
     # Read JSON from stdin (output from luma_sync.py)
     try:

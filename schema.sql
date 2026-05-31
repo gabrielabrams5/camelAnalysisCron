@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS attendance (
     rsvp_datetime TIMESTAMP,
     is_first_event BOOLEAN NOT NULL DEFAULT false,
     invite_token_id INTEGER NOT NULL,
+    additional_info JSONB,
     UNIQUE (person_id, event_id),
     CONSTRAINT fk_attendance_person
         FOREIGN KEY (person_id)
