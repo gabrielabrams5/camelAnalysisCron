@@ -115,17 +115,13 @@ def get_event_attendees(event_id):
 
         print("\nFetching attendees...")
 
-        # Prefer the per-event snapshot on attendance.additional_info.
-        # Fall back to people.additional_info for historical events imported
-        # before per-attendance snapshots existed (when people.additional_info
-        # held a single overwritten snapshot per person).
         query = """
             SELECT
                 p.first_name,
                 p.last_name,
                 COALESCE(p.school_email, p.personal_email) as email,
                 p.phone_number,
-                COALESCE(a.additional_info, p.additional_info::jsonb) AS additional_info
+                p.additional_info
             FROM attendance a
             JOIN people p ON a.person_id = p.id
             WHERE a.event_id = %s
