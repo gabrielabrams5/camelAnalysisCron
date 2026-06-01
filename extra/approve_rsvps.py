@@ -82,7 +82,7 @@ def fetch_pending_rsvps(event_api_id):
         List of guest dictionaries with pending approval status
     """
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'Content-Type': 'application/json'
     }
 
@@ -133,7 +133,7 @@ def approve_guest(event_id, guest_email):
     """
     url = f"{LUMA_API_BASE_URL}/event/update-guest-status"
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'accept': 'application/json',
         'content-type': 'application/json'
     }
@@ -170,7 +170,7 @@ def decline_guest(event_id, guest_email):
     """
     url = f"{LUMA_API_BASE_URL}/event/update-guest-status"
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'accept': 'application/json',
         'content-type': 'application/json'
     }

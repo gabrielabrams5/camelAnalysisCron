@@ -23,7 +23,7 @@ def main():
         return
 
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'Content-Type': 'application/json'
     }
 

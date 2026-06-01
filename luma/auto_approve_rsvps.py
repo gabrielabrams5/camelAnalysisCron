@@ -48,7 +48,7 @@ APPROVED_DOMAINS = ['@college.harvard.edu', '@mit.edu', '@harvard.edu']
 
 # API headers
 HEADERS = {
-    'Authorization': f'Bearer {LUMA_API_KEY}',
+    'x-luma-api-key': LUMA_API_KEY,
     'accept': 'application/json',
     'content-type': 'application/json'
 }

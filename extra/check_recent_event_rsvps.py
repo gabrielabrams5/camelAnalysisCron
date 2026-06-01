@@ -58,7 +58,7 @@ def fetch_all_events():
         List of event dictionaries
     """
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'Content-Type': 'application/json'
     }
 
@@ -117,7 +117,7 @@ def fetch_event_rsvps_by_status(event_api_id, approval_status):
         List of guest dictionaries
     """
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'Content-Type': 'application/json'
     }
 
