@@ -297,14 +297,18 @@ def get_event_metrics(conn, event_id):
     return metrics
 
 
-def get_previous_events_by_datetime(conn, current_event_id, limit=4):
+def get_previous_events_by_datetime(conn, current_event_id, limit=4, min_attendance=10):
     """
     Get the previous N events before the current event, ordered by datetime.
+
+    Only events with checked-in attendance strictly greater than ``min_attendance``
+    are returned, so historical comparisons skip canceled / low-turnout events.
 
     Args:
         conn: Database connection
         current_event_id: ID of the current event
         limit: Maximum number of previous events to return (default: 4)
+        min_attendance: Exclude events whose checked-in attendance is <= this value (default: 10)
 
     Returns:
         List of tuples (event_id, event_name, start_datetime) in reverse chronological order (most recent first)
@@ -325,14 +329,18 @@ def get_previous_events_by_datetime(conn, current_event_id, limit=4):
 
         current_event_datetime = result[0]
 
-        # Get previous events ordered by datetime
+        # Get previous events ordered by datetime, excluding low-attendance events
         cursor.execute("""
-            SELECT id, event_name, start_datetime
-            FROM events
-            WHERE start_datetime < %s
-            ORDER BY start_datetime DESC
+            SELECT e.id, e.event_name, e.start_datetime
+            FROM events e
+            WHERE e.start_datetime < %s
+              AND (
+                  SELECT COUNT(*) FROM attendance a
+                  WHERE a.event_id = e.id AND a.checked_in = TRUE
+              ) > %s
+            ORDER BY e.start_datetime DESC
             LIMIT %s
-        """, (current_event_datetime, limit))
+        """, (current_event_datetime, min_attendance, limit))
 
         return cursor.fetchall()
 
