@@ -64,7 +64,7 @@ def get_luma_events():
         sys.exit(1)
 
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'Content-Type': 'application/json'
     }
 
@@ -113,7 +113,7 @@ def download_event_json(event_api_id, save_path):
     Returns: True if successful, False otherwise
     """
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'Content-Type': 'application/json'
     }
 

@@ -41,7 +41,7 @@ def get_recent_events(limit=5):
         List of event dictionaries sorted by date (most recent first)
     """
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'Content-Type': 'application/json'
     }
 
@@ -87,7 +87,7 @@ def get_event_guests(event_api_id):
         List of all guest dictionaries
     """
     headers = {
-        'Authorization': f'Bearer {LUMA_API_KEY}',
+        'x-luma-api-key': LUMA_API_KEY,
         'Content-Type': 'application/json'
     }
 
