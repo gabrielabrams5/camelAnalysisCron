@@ -7,6 +7,29 @@ set -e  # Exit on error
 # Get script directory for relative paths
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+# Overlap guard: cron fires every 6 hours regardless of whether the previous
+# run finished. Without this, a slow/hung run causes concurrent pipelines
+# (duplicate imports, port collisions in placard generation, DB contention).
+# flock is available in the Railway container (util-linux); skipped on macOS.
+if command -v flock >/dev/null 2>&1; then
+    exec 200>/tmp/luma_pipeline.lock
+    if ! flock -n 200; then
+        echo "Another pipeline run is already in progress - exiting."
+        exit 0
+    fi
+fi
+
+# Per-step timeout wrapper so no single step can hang the pipeline forever.
+# Uses coreutils timeout when available (Railway container); runs bare on macOS.
+run_step() {
+    local duration="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$duration" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Load environment variables from .env file
 if [ -f "$SCRIPT_DIR/.env" ]; then
     set -a
@@ -23,14 +46,14 @@ echo "========================================="
 echo ""
 echo "Step 1: Syncing events from Luma API..."
 set +e  # Temporarily allow non-zero exit codes
-events_json=$(python3 "$SCRIPT_DIR/luma_sync.py")
+events_json=$(run_step 30m python3 "$SCRIPT_DIR/luma_sync.py")
 sync_exit_code=$?
 set -e  # Re-enable exit on error
 
 # Step 2: Auto-approve pending RSVPs for upcoming events
 echo ""
 echo "Step 2: Auto-approving pending RSVPs for upcoming events..."
-python3 "$SCRIPT_DIR/luma/auto_approve_rsvps.py"
+run_step 15m python3 "$SCRIPT_DIR/luma/auto_approve_rsvps.py"
 
 if [ $? -eq 0 ]; then
     echo "RSVP auto-approval completed successfully"
@@ -42,7 +65,7 @@ fi
 if [ $sync_exit_code -eq 0 ]; then
     echo ""
     echo "Step 3: Importing attendance data from Luma CSVs..."
-    echo "$events_json" | python3 "$SCRIPT_DIR/import_luma_attendance.py"
+    echo "$events_json" | run_step 30m python3 "$SCRIPT_DIR/import_luma_attendance.py"
 
     if [ $? -eq 0 ]; then
         echo "Attendance import completed successfully"
@@ -69,26 +92,12 @@ except:
     if [ -n "$event_ids" ]; then
         for event_id in $event_ids; do
             echo "  Analyzing event ID: $event_id"
-            python3 "$SCRIPT_DIR/event_analysis_single.py" --event-id "$event_id" --outdir "$SCRIPT_DIR/analysis_outputs"
+            run_step 15m python3 "$SCRIPT_DIR/event_analysis_single.py" --event-id "$event_id" --outdir "$SCRIPT_DIR/analysis_outputs"
 
             if [ $? -eq 0 ]; then
                 echo "  ✅ Event $event_id analysis completed"
             else
                 echo "  ⚠️  Event $event_id analysis encountered errors"
-            fi
-
-            # Tag attendees and RSVP no-shows in Mailchimp (if credentials configured)
-            if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
-                echo "  Tagging attendees and RSVP no-shows in Mailchimp for event $event_id..."
-                python3 "$SCRIPT_DIR/mailChimp/tag_mailchimp_attendees.py" --event-id "$event_id"
-
-                if [ $? -eq 0 ]; then
-                    echo "  ✅ Event $event_id Mailchimp tagging completed"
-                else
-                    echo "  ⚠️  Event $event_id Mailchimp tagging encountered errors"
-                fi
-            else
-                echo "  Mailchimp credentials not configured - skipping event tagging"
             fi
         done
     else
@@ -98,7 +107,7 @@ except:
     # Step 5: Generate placard PDFs for all analyzed events
     echo ""
     echo "Step 5: Generating placard PDFs for analyzed events..."
-    python3 "$SCRIPT_DIR/generate_all_placards.py" --input-csv "$SCRIPT_DIR/analysis_outputs/event_analysis_all.csv" --placard-dir "$SCRIPT_DIR/placard_generation"
+    run_step 60m python3 "$SCRIPT_DIR/generate_all_placards.py" --input-csv "$SCRIPT_DIR/analysis_outputs/event_analysis_all.csv" --placard-dir "$SCRIPT_DIR/placard_generation"
 
     if [ $? -eq 0 ]; then
         echo "Placard generation completed successfully"
@@ -109,7 +118,7 @@ except:
     # Step 6: Run comprehensive analytics
     echo ""
     echo "Step 6: Running comprehensive analytics..."
-    python3 "$SCRIPT_DIR/analyze.py" --outdir "$SCRIPT_DIR/analysis_outputs"
+    run_step 30m python3 "$SCRIPT_DIR/analyze.py" --outdir "$SCRIPT_DIR/analysis_outputs"
 
     if [ $? -eq 0 ]; then
         echo "Analytics completed successfully"
@@ -124,7 +133,7 @@ except:
     # Check if Mailchimp credentials are configured
     if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
         set +e  # Temporarily allow non-zero exit codes
-        python3 "$SCRIPT_DIR/mailChimp/sync_mailchimp_audience.py"
+        run_step 30m python3 "$SCRIPT_DIR/mailChimp/sync_mailchimp_audience.py"
         mailchimp_exit_code=$?
         set -e  # Re-enable exit on error
 
@@ -140,6 +149,36 @@ except:
 else
     echo ""
     echo "Step 3: No events require attendance import (skipping steps 3-7)"
+fi
+
+# Step 8: Tag attendees and RSVP no-shows in Mailchimp for any untagged past events.
+# Runs on EVERY pipeline run (self-healing): an event whose tagging failed in a
+# previous run is retried here until it succeeds, and newly imported events are
+# tagged in the same run. Gated on events.mailchimp_tagged_at in the database.
+echo ""
+echo "Step 8: Tagging Mailchimp attendees for untagged past events..."
+if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
+    set +e  # A tagging failure should not abort the pipeline; it will retry next run
+    untagged_event_ids=$(run_step 5m python3 "$SCRIPT_DIR/mailChimp/tag_mailchimp_attendees.py" --list-untagged)
+    if [ $? -ne 0 ]; then
+        echo "  ⚠️  Failed to query untagged events"
+    elif [ -n "$untagged_event_ids" ]; then
+        for event_id in $untagged_event_ids; do
+            echo "  Tagging attendees and RSVP no-shows in Mailchimp for event $event_id..."
+            run_step 15m python3 "$SCRIPT_DIR/mailChimp/tag_mailchimp_attendees.py" --event-id "$event_id"
+
+            if [ $? -eq 0 ]; then
+                echo "  ✅ Event $event_id Mailchimp tagging completed"
+            else
+                echo "  ⚠️  Event $event_id Mailchimp tagging encountered errors (will retry next run)"
+            fi
+        done
+    else
+        echo "  No untagged events - nothing to do"
+    fi
+    set -e
+else
+    echo "Mailchimp credentials not configured - skipping event tagging"
 fi
 
 echo ""

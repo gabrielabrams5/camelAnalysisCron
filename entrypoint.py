@@ -60,7 +60,7 @@ def generate_crontab():
             crontab_lines.append(f'{var}="{escaped_value}"')
 
     # Add the cron schedule
-    crontab_lines.append('0 */6 * * * cd /app && /bin/bash /app/run_luma_pipeline.sh >> /var/log/cron.log 2>&1')
+    crontab_lines.append('0 */6 * * * cd /app && timeout 3h /bin/bash /app/run_luma_pipeline.sh >> /var/log/cron.log 2>&1')
 
     # Write to crontab file
     crontab_content = '\n'.join(crontab_lines) + '\n'
@@ -151,11 +151,18 @@ def main():
 
     log("")
 
-    # Show crontab
-    log("Crontab contents:")
+    # Show crontab (redact env var values - they include credentials)
+    log("Crontab contents (values redacted):")
     try:
         result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
-        log(result.stdout)
+        redacted_lines = []
+        for line in result.stdout.splitlines():
+            if '=' in line and not line.startswith(('#', '0 ', '*')):
+                var_name = line.split('=', 1)[0]
+                redacted_lines.append(f'{var_name}=<redacted>')
+            else:
+                redacted_lines.append(line)
+        log('\n'.join(redacted_lines))
     except Exception as e:
         log(f"Could not read crontab: {e}")
 
@@ -170,7 +177,8 @@ def main():
         result = subprocess.run(
             ['/bin/bash', '/app/run_luma_pipeline.sh'],
             capture_output=False,  # Show output in real-time
-            text=True
+            text=True,
+            timeout=3 * 3600  # must never block the container past the next cron window
         )
 
         log("")
@@ -179,6 +187,8 @@ def main():
         else:
             log(f"⚠️  Initial pipeline run failed with exit code: {result.returncode}")
             log("Check the output above for errors.")
+    except subprocess.TimeoutExpired:
+        log("⚠️  Initial pipeline run timed out after 3 hours and was killed.")
     except Exception as e:
         log(f"⚠️  Initial pipeline run failed with exception: {e}")
 

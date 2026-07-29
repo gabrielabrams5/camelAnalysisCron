@@ -347,6 +347,30 @@ def update_event_attendance_count(conn, event_id):
         cursor.close()
 
 
+def mark_attendance_imported(conn, event_id):
+    """
+    Record that attendance import completed for an event.
+
+    Sets events.attendance_imported_at, which luma_sync.py uses as the
+    "already processed" gate. This must be set even for events with zero
+    guests or zero check-ins, otherwise they are re-imported on every run.
+
+    Args:
+        conn: Database connection
+        event_id: ID of the event to mark
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            UPDATE events
+            SET attendance_imported_at = NOW()
+            WHERE id = %s
+        """, (event_id,))
+        conn.commit()
+    finally:
+        cursor.close()
+
+
 def update_person_attendance_counts(conn, event_id):
     """
     Update event_attendance_count for all people who attended a specific event.
@@ -1125,6 +1149,9 @@ def process_event_json(event_id, json_path, event_name, log_people=False):
 
         # Update person attendance counts for all people who attended this event
         people_updated = update_person_attendance_counts(conn, event_id)
+
+        # Close the import gate so luma_sync.py doesn't re-process this event
+        mark_attendance_imported(conn, event_id)
 
         # Print enhanced statistics
         logging.info(f"\n=== Import Complete for {event_name} ===")

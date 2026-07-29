@@ -172,6 +172,62 @@ def get_event_attendees(event_id: int) -> tuple[Optional[str], List[Dict[str, st
             conn.close()
 
 
+def get_untagged_event_ids() -> List[int]:
+    """
+    Query database for past events whose attendance has been imported but
+    whose Mailchimp tagging has not completed yet.
+
+    Returns:
+        List of event IDs, oldest first
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id
+            FROM events
+            WHERE attendance_imported_at IS NOT NULL
+              AND mailchimp_tagged_at IS NULL
+              AND start_datetime < NOW()
+            ORDER BY start_datetime
+        """)
+        return [row[0] for row in cursor.fetchall()]
+    except psycopg2.Error as e:
+        raise ConnectionError(f"Failed to query untagged events: {e}")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def mark_event_tagged(event_id: int) -> None:
+    """
+    Record that Mailchimp tagging completed successfully for an event,
+    so the pipeline's self-healing tag step stops retrying it.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE events
+            SET mailchimp_tagged_at = NOW()
+            WHERE id = %s
+        """, (event_id,))
+        conn.commit()
+    except psycopg2.Error as e:
+        raise ConnectionError(f"Failed to mark event {event_id} as tagged: {e}")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
 def get_event_rsvp_no_shows(event_id: int) -> List[Dict[str, str]]:
     """
     Query database for all people who RSVP'd but did not check in to a specific event.
@@ -278,8 +334,13 @@ def main():
     parser.add_argument(
         '--event-id',
         type=int,
-        required=True,
         help='Database ID of the event to tag attendees for'
+    )
+    parser.add_argument(
+        '--list-untagged',
+        action='store_true',
+        help='Print IDs of past events with attendance imported but Mailchimp '
+             'tagging not yet completed (one per line), then exit'
     )
     parser.add_argument(
         '--only-attendees',
@@ -310,7 +371,7 @@ def main():
     required_env_vars = [
         'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD'
     ]
-    if not args.dry_run:
+    if not args.dry_run and not args.list_untagged:
         required_env_vars.extend([
             'MAILCHIMP_API_KEY',
             'MAILCHIMP_SERVER_PREFIX',
@@ -321,6 +382,18 @@ def main():
     if missing_vars:
         logging.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         sys.exit(1)
+
+    if args.list_untagged:
+        try:
+            for event_id in get_untagged_event_ids():
+                print(event_id)
+            sys.exit(0)
+        except ConnectionError as e:
+            logging.error(f"Database connection error: {e}")
+            sys.exit(1)
+
+    if args.event_id is None:
+        parser.error('--event-id is required unless --list-untagged is used')
 
     try:
         # Query database for attendees
@@ -335,6 +408,8 @@ def main():
         if not attendees and not rsvp_no_shows:
             logging.warning(f"No attendees or RSVPs found for event '{event_name}'")
             print(f"\nNo one to tag for event: {event_name}")
+            if not args.dry_run and not args.only_attendees:
+                mark_event_tagged(args.event_id)
             sys.exit(0)
 
         # Display summary
@@ -444,6 +519,14 @@ def main():
         print(f"  Total people processed: {total_people}")
         print(f"  Total errors:          {total_errors}")
         print("="*60)
+
+        # Mark the event as tagged unless nothing was tagged at all.
+        # Per-member errors are deterministic data problems (junk emails) that a
+        # retry can never fix; only a total failure (0 tagged, e.g. Mailchimp
+        # outage) should leave mailchimp_tagged_at NULL so the pipeline retries.
+        total_tagged = combined_stats['attendees']['tagged'] + combined_stats['rsvp_no_shows']['tagged']
+        if not args.only_attendees and (total_errors == 0 or total_tagged > 0):
+            mark_event_tagged(args.event_id)
 
         # Exit with appropriate status code
         if total_errors > 0:

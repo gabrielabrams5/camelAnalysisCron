@@ -102,12 +102,16 @@ def transform_event(event_id, input_csv, placard_dir):
             ],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            timeout=300
         )
 
         print(f"  ✓ Transformed event {event_id} to placard format")
         return True
 
+    except subprocess.TimeoutExpired:
+        print(f"  ✗ Transform timed out for event {event_id}", file=sys.stderr)
+        return False
     except subprocess.CalledProcessError as e:
         print(f"  ✗ Error transforming event {event_id}: {e.stderr}", file=sys.stderr)
         return False
@@ -136,7 +140,8 @@ def generate_pdf(placard_dir):
             ['node', 'generate-pdf.mjs'],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            timeout=900  # backstop for generate-pdf.mjs's own 10-minute watchdog
         )
 
         print(f"  ✓ Generated PDF")
@@ -152,6 +157,10 @@ def generate_pdf(placard_dir):
             print(f"  ✗ PDF file not found at {pdf_path}", file=sys.stderr)
             return None
 
+    except subprocess.TimeoutExpired:
+        print(f"  ✗ PDF generation timed out", file=sys.stderr)
+        os.chdir(original_dir)
+        return None
     except subprocess.CalledProcessError as e:
         print(f"  ✗ Error generating PDF: {e.stderr}", file=sys.stderr)
         os.chdir(original_dir)

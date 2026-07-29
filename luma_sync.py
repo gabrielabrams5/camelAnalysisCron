@@ -180,18 +180,18 @@ def event_exists_in_db(cursor, luma_event_id):
     Args:
         cursor: Database cursor
         luma_event_id: Luma event ID to check
-    Returns: Tuple (exists: bool, db_event_id: int or None, attendance: int)
+    Returns: Tuple (exists: bool, db_event_id: int or None, attendance_imported: bool)
     """
     cursor.execute("""
-        SELECT id, attendance
+        SELECT id, attendance_imported_at
         FROM events
         WHERE luma_event_id = %s
     """, (luma_event_id,))
 
     result = cursor.fetchone()
     if result:
-        return True, result[0], result[1] or 0
-    return False, None, 0
+        return True, result[0], result[1] is not None
+    return False, None, False
 
 
 def create_event(cursor, luma_event):
@@ -407,7 +407,7 @@ def sync_events():
                 continue
 
             # Check if event exists in database
-            exists, db_event_id, attendance = event_exists_in_db(cursor, luma_event_id)
+            exists, db_event_id, attendance_imported = event_exists_in_db(cursor, luma_event_id)
 
             if start_datetime > now:
                 # Future event - create or update metadata
@@ -421,10 +421,10 @@ def sync_events():
                 if not exists:
                     # Create the event first
                     db_event_id = create_event(cursor, luma_event)
-                    attendance = 0
+                    attendance_imported = False
 
                 # Check if needs attendance processing
-                if attendance == 0:
+                if not attendance_imported:
                     # Download JSON to temp file
                     temp_file = tempfile.NamedTemporaryFile(
                         mode='w',

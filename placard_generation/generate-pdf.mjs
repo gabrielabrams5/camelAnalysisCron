@@ -67,13 +67,24 @@ function createServer() {
   });
 }
 
+// Hard ceiling on total runtime: this script is run unattended by the cron
+// pipeline, and a wedged Chromium/build must never hang the pipeline forever.
+const WATCHDOG_MS = 10 * 60 * 1000;
+setTimeout(() => {
+  console.error(`⏰ Watchdog: PDF generation exceeded ${WATCHDOG_MS / 60000} minutes, exiting`);
+  process.exit(1);
+}, WATCHDOG_MS).unref();
+
 (async () => {
   console.log("🔨 Building the React app...");
-  await execAsync("npm run build");
+  await execAsync("npm run build", { timeout: 5 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 });
 
   console.log("🚀 Starting local server...");
   const server = createServer();
-  await new Promise((resolve) => server.listen(PORT, resolve));
+  await new Promise((resolve, reject) => {
+    server.on("error", reject); // e.g. EADDRINUSE from an overlapping run
+    server.listen(PORT, resolve);
+  });
 
   console.log(`📄 Generating PDF from http://localhost:${PORT}...`);
 
