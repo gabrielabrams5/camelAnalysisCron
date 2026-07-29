@@ -2,6 +2,9 @@
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
+# Cron service: Railway starts the container on the schedule set in the
+# service settings and the container exits when the pipeline finishes.
+# NEVER restart on failure - a failed run should wait for the next scheduled
+# fire, not re-run the whole pipeline up to 10 times.
 [deploy]
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
+restartPolicyType = "NEVER"

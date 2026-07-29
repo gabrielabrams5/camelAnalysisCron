@@ -1,92 +1,36 @@
 #!/usr/bin/env python3
 """
-Entrypoint script for the cron service.
-Handles startup, environment validation, and keeps container alive.
+Entrypoint script for the Railway cron service.
+
+Railway starts this container on its native cron schedule (service settings ->
+Cron Schedule) and expects it to run the job and EXIT. Runs the Luma pipeline
+once, then exits with the pipeline's status code. Do not add keep-alive loops
+here: a container that never exits shows up in Railway as a cron run stuck
+"running" forever, and blocks subsequent scheduled runs.
 """
 import os
 import sys
 import subprocess
-import time
 from datetime import datetime
 
 # Force unbuffered output
 sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
 sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
-# Print immediately to confirm Python is running
-print("=" * 50, flush=True)
-print("ENTRYPOINT STARTING - Python is running!", flush=True)
-print("=" * 50, flush=True)
+# Hard ceiling on a single pipeline run
+PIPELINE_TIMEOUT_SECONDS = 3 * 3600
+
 
 def log(message):
     """Print with timestamp"""
     print(f"[{datetime.now().isoformat()}] {message}", flush=True)
 
-def generate_crontab():
-    """Generate crontab file with environment variables from Railway"""
-    log("Generating crontab with environment variables...")
-
-    # Collect all environment variables needed for the cron job
-    env_vars_to_export = [
-        'SHELL',
-        'PATH',
-        'PGHOST',
-        'PGDATABASE',
-        'PGUSER',
-        'PGPASSWORD',
-        'PGPORT',
-        'LUMA_API_KEY',
-        'LUMA_CALENDAR_ID',
-        'MAILCHIMP_API_KEY',
-        'MAILCHIMP_AUDIENCE_ID',
-        'MAILCHIMP_SERVER_PREFIX',
-    ]
-
-    crontab_lines = []
-
-    # Add SHELL and PATH
-    crontab_lines.append('SHELL=/bin/bash')
-    crontab_lines.append('PATH=/usr/local/bin:/usr/bin:/bin')
-
-    # Add all environment variables
-    for var in env_vars_to_export:
-        if var in ['SHELL', 'PATH']:
-            continue  # Already added above
-
-        value = os.getenv(var)
-        if value:
-            # Escape any special characters in the value
-            escaped_value = value.replace('$', '\\$').replace('"', '\\"')
-            crontab_lines.append(f'{var}="{escaped_value}"')
-
-    # Add the cron schedule
-    crontab_lines.append('0 */6 * * * cd /app && timeout 3h /bin/bash /app/run_luma_pipeline.sh >> /var/log/cron.log 2>&1')
-
-    # Write to crontab file
-    crontab_content = '\n'.join(crontab_lines) + '\n'
-
-    try:
-        with open('/etc/cron.d/analytics-cron', 'w') as f:
-            f.write(crontab_content)
-
-        # Set proper permissions
-        os.chmod('/etc/cron.d/analytics-cron', 0o644)
-
-        # Load the crontab
-        subprocess.run(['crontab', '/etc/cron.d/analytics-cron'], check=True)
-
-        log("✅ Crontab generated successfully")
-        return True
-    except Exception as e:
-        log(f"❌ ERROR: Failed to generate crontab: {e}")
-        return False
 
 def main():
     log("=" * 50)
-    log("Luma Event Sync & Analytics Cron Service Starting...")
+    log("Luma Event Sync & Analytics Pipeline Run Starting...")
     log("=" * 50)
     log(f"Current time: {datetime.now()}")
-    log("Cron schedule: Every 6 hours (0 */6 * * *)")
     log("")
 
     # Check environment variables
@@ -115,107 +59,36 @@ def main():
     if missing:
         log(f"❌ ERROR: Missing required environment variables: {', '.join(missing)}")
         log("Please set these variables in Railway's Variables tab")
-        log("")
-        log("Sleeping for 1 hour to keep container alive for debugging...")
-        time.sleep(3600)
-        sys.exit(1)
+        return 1
 
     log("✅ Environment variables configured")
     log("")
-
-    # Generate crontab with environment variables
-    if not generate_crontab():
-        log("Sleeping for 1 hour to keep container alive for debugging...")
-        time.sleep(3600)
-        sys.exit(1)
-
-    log("")
-
-    # Start cron daemon
-    log("Starting cron daemon...")
-    try:
-        subprocess.run(['cron'], check=True)
-        time.sleep(2)  # Give cron time to start
-
-        # Verify cron is running
-        result = subprocess.run(['pgrep', 'cron'], capture_output=True)
-        if result.returncode != 0:
-            raise Exception("Cron process not found")
-
-        log("✅ Cron daemon started successfully")
-    except Exception as e:
-        log(f"❌ ERROR: Failed to start cron daemon: {e}")
-        log("Sleeping for 1 hour to keep container alive for debugging...")
-        time.sleep(3600)
-        sys.exit(1)
-
-    log("")
-
-    # Show crontab (redact env var values - they include credentials)
-    log("Crontab contents (values redacted):")
-    try:
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
-        redacted_lines = []
-        for line in result.stdout.splitlines():
-            if '=' in line and not line.startswith(('#', '0 ', '*')):
-                var_name = line.split('=', 1)[0]
-                redacted_lines.append(f'{var_name}=<redacted>')
-            else:
-                redacted_lines.append(line)
-        log('\n'.join(redacted_lines))
-    except Exception as e:
-        log(f"Could not read crontab: {e}")
-
-    log("")
-
-    # Run initial pipeline
-    log("=" * 50)
-    log("Running Initial Luma Sync & Analytics Pipeline")
-    log("=" * 50)
 
     try:
         result = subprocess.run(
             ['/bin/bash', '/app/run_luma_pipeline.sh'],
             capture_output=False,  # Show output in real-time
             text=True,
-            timeout=3 * 3600  # must never block the container past the next cron window
+            timeout=PIPELINE_TIMEOUT_SECONDS
         )
 
         log("")
         if result.returncode == 0:
-            log("✅ Initial pipeline run completed successfully!")
+            log("✅ Pipeline run completed successfully!")
         else:
-            log(f"⚠️  Initial pipeline run failed with exit code: {result.returncode}")
+            log(f"⚠️  Pipeline run failed with exit code: {result.returncode}")
             log("Check the output above for errors.")
+        return result.returncode
     except subprocess.TimeoutExpired:
-        log("⚠️  Initial pipeline run timed out after 3 hours and was killed.")
-    except Exception as e:
-        log(f"⚠️  Initial pipeline run failed with exception: {e}")
+        log(f"⚠️  Pipeline run timed out after {PIPELINE_TIMEOUT_SECONDS // 3600} hours and was killed.")
+        return 1
 
-    log("")
-    log("=" * 50)
-    log("Service is Running")
-    log("=" * 50)
-    log("Scheduled runs: Every 6 hours")
-    log("Volume mount: /app/analysis_outputs")
-    log("")
-    log("Cron logs will appear below:")
-    log("-" * 50)
-
-    # Tail the log file to keep container alive
-    try:
-        subprocess.run(['tail', '-f', '/var/log/cron.log'])
-    except KeyboardInterrupt:
-        log("Shutting down...")
-        sys.exit(0)
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main())
     except Exception as e:
         log(f"FATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
-        log("Sleeping for 1 hour to allow debugging...")
-        time.sleep(3600)
         sys.exit(1)
