@@ -14,17 +14,20 @@ The script processes events happening in the **next 2 weeks** and applies these 
 
 **Auto-approve if:**
 1. **Returning attendee**: Person has attended 2 or more events (based on `event_attendance_count` in database)
-2. **Last-minute + verified email**: Event starts in ≤24 hours AND person has a Harvard/MIT email address
+2. **Last-minute + verified student email**: Event starts in ≤24 hours AND person has a *verified* student email:
+   - an `@mit.edu` address, **or**
+   - a Harvard address (`@college.harvard.edu` / `@harvard.edu`) that is **also in the `harvard_students` table**. A Harvard-looking address that is not in the list is *not* approved (fail closed).
 
-**Email verification checks:**
+**Email verification checks** (first verified address wins):
 - Primary: Main RSVP email field
 - Secondary: "School email (.edu)" custom registration field
 - Database: Cross-reference with `school_email` or `personal_email` in people table
 
-**Approved email domains:**
-- `@college.harvard.edu`
-- `@mit.edu`
-- `@harvard.edu`
+**Harvard student list:** the `harvard_students` table is loaded from `mailChimp/harvard_students_with_emails.csv` with `python3 mailChimp/load_harvard_students.py`. The CSV is gitignored (public repo, contains PII) so re-run the loader locally whenever the CSV changes. If the table is empty the script logs an error and skips Harvard-email approvals until it is loaded.
+
+**Logging:** every accept/reject decision is logged at INFO level with its reason, so the cron output alone explains why each RSVP was or wasn't approved.
+
+**Exit code:** non-zero if configuration/API/DB access fails or any approval call fails, so the pipeline reports the step as failed.
 
 #### Person Matching Strategy
 

@@ -58,7 +58,7 @@ All files are saved to a persistent Railway volume for long-term storage.
 ## Pipeline Execution Flow
 
 ```
-CRON TRIGGER (every 6 hours)
+CRON TRIGGER (Railway cron, nightly at midnight ET)
   ↓
 Step 1: luma_sync.py
   ├─ Fetch all Luma events via API
@@ -67,7 +67,8 @@ Step 1: luma_sync.py
   └─ Output: List of JSON files to process
   ↓
 Step 2: auto_approve_rsvps.py
-  └─ Auto-approve Harvard/MIT RSVPs for upcoming events
+  └─ Auto-approve returning attendees, and (≤24h before the event)
+     verified Harvard students (harvard_students table) / MIT emails
   ↓
 Step 3: import_luma_attendance.py (only if JSON files downloaded)
   ├─ Parse registration_answers for custom fields
@@ -325,7 +326,8 @@ docker run -v $(pwd)/analysis_outputs:/app/analysis_outputs event-analytics
 | `PGUSER` | Database user | `postgres` | Yes |
 | `PGPASSWORD` | Database password | `your-password-here` | Yes |
 | `LUMA_API_KEY` | Luma API authentication key | `lu_api_xxx...` | Yes |
-| `LUMA_CALENDAR_ID` | Optional Luma calendar ID filter | `cal-abc123` | No |
+| `LUMA_CALENDAR_ID` | Luma calendar ID (used by event sync and RSVP auto-approval) | `cal-abc123` | Yes |
+| `PIPELINE_MODE` | `full` (default) runs the whole pipeline; `auto_approve` runs only the RSVP auto-approval (for an hourly second cron service) | `auto_approve` | No |
 | `MAILCHIMP_API_KEY` | Mailchimp API key | `abc123...` | No* |
 | `MAILCHIMP_SERVER_PREFIX` | Mailchimp server prefix from API key | `us21` | No* |
 | `MAILCHIMP_AUDIENCE_ID` | Mailchimp audience/list ID | `a1b2c3d4e5` | No* |
@@ -1446,7 +1448,7 @@ python extra/approve_rsvps.py
 
 ## Luma RSVP Auto-Approval
 
-The `luma/auto_approve_rsvps.py` script automatically approves pending Luma RSVPs based on attendance history and event timing. It runs as **Step 2** in the automated pipeline (every 6 hours) and can also be run manually.
+The `luma/auto_approve_rsvps.py` script automatically approves pending Luma RSVPs based on attendance history and event timing. It runs as **Step 2** in the automated pipeline (nightly) and can also be run manually or on its own hourly schedule (see [Hourly approvals](#hourly-approvals-recommended) below).
 
 ### Auto-Approval Rules
 
@@ -1454,17 +1456,33 @@ The script processes events happening in the **next 2 weeks** and applies these 
 
 **Auto-approve if:**
 1. **Returning attendee**: Person has attended 2 or more events (based on `event_attendance_count` in database)
-2. **Last-minute + verified email**: Event starts in ≤24 hours AND person has a Harvard/MIT email address
+2. **Last-minute + verified student email**: Event starts in ≤24 hours AND person has a *verified* student email:
+   - an `@mit.edu` address, **or**
+   - a Harvard address (`@college.harvard.edu` / `@harvard.edu`) that is **also present in the `harvard_students` table**. A Harvard-looking address that is not in the list is *not* approved.
 
-**Email verification checks:**
+**Email verification checks** (first verified address wins):
 - Primary: Main RSVP email field
 - Secondary: "School email (.edu)" custom registration field
 - Database: Cross-reference with `school_email` or `personal_email` in people table
 
-**Approved email domains:**
-- `@college.harvard.edu`
-- `@mit.edu`
-- `@harvard.edu`
+Every decision is logged at INFO level with the reason, e.g. `✗ Jane Doe (jane@college.harvard.edu) - not in DB | 0 events (needs 2+) | event in 48.6h (needs ≤24h ...) | checked emails: main: jane@college.harvard.edu (Harvard email NOT in student list)`.
+
+### Harvard Student List (security layer)
+
+The Harvard directory export `mailChimp/harvard_students_with_emails.csv` is the source of truth for "is this a real Harvard student". It is **gitignored on purpose** (this GitHub repo is public and the file holds ~4,600 names and emails), so the Railway container never sees the file. Instead the list lives in the `harvard_students` database table, and the auto-approve script reads that table.
+
+Whenever the CSV is updated, load it into the database from your machine:
+
+```bash
+python3 mailChimp/load_harvard_students.py --dry-run   # parse + report only
+python3 mailChimp/load_harvard_students.py             # full refresh of the table
+```
+
+The loader lowercases emails, skips rows without an email, and drops any address shared by several rows (directory placeholders such as the IT help desk address). If the table is empty or missing, the auto-approve script logs an error and disables Harvard-email approvals until the list is loaded (fail closed); returning-attendee approvals are unaffected.
+
+### Hourly approvals (recommended)
+
+The nightly run fires at midnight ET, i.e. *after* any same-day event has already started, so RSVPs that arrive on the day of an event never get auto-approved by the nightly run alone. To fix that, add a second Railway service on the same repo/Dockerfile with the variable `PIPELINE_MODE=auto_approve` and an hourly cron schedule (`0 * * * *`). In that mode `entrypoint.py` runs only `luma/auto_approve_rsvps.py` (about 20 seconds) and exits.
 
 ### Person Matching Strategy
 

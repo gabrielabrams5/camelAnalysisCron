@@ -131,6 +131,25 @@ CREATE TABLE IF NOT EXISTS event_feedback (
 
 
 -- ============================================
+-- TABLE: harvard_students
+-- ============================================
+-- Verified Harvard student directory used by luma/auto_approve_rsvps.py:
+-- a Harvard-domain RSVP email only counts as a verified student if it is in
+-- this table. Loaded from mailChimp/harvard_students_with_emails.csv (which
+-- is gitignored - the repo is public) by mailChimp/load_harvard_students.py.
+
+CREATE TABLE IF NOT EXISTS harvard_students (
+    email VARCHAR(255) PRIMARY KEY,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    full_name VARCHAR(200),
+    profile_url TEXT,
+    source_file VARCHAR(255),
+    loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+-- ============================================
 -- TABLE: invitetokens
 -- ============================================
 

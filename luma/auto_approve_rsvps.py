@@ -8,12 +8,22 @@ Rules:
 3. Matches RSVPs to database by email (primary) or exact first+last name (backup)
 4. Auto-approves if:
    - Person has attended 2+ events, OR
-   - Event is within 24 hours AND person has Harvard/MIT email
+   - Event is within 24 hours AND person has a VERIFIED student email:
+       * an @mit.edu email, or
+       * a Harvard email (@college.harvard.edu / @harvard.edu) that is ALSO
+         present in the `harvard_students` table. That table is loaded from
+         mailChimp/harvard_students_with_emails.csv by
+         mailChimp/load_harvard_students.py. A Harvard-looking email that is
+         not in the list is NOT approved (fail closed).
 
 Usage:
     python3 luma/auto_approve_rsvps.py              # Execute approvals
     python3 luma/auto_approve_rsvps.py --dry-run    # Preview without approving
     python3 luma/auto_approve_rsvps.py --verbose    # Detailed logging
+
+Exit codes:
+    0  ran to completion, every approval call succeeded
+    1  configuration/API/DB failure, or at least one approval call failed
 """
 
 import os
@@ -26,8 +36,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables (repo-root .env when run locally; no-op on Railway)
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'))
 
 # Database configuration
 DB_CONFIG = {
@@ -43,8 +53,16 @@ LUMA_API_KEY = os.getenv('LUMA_API_KEY')
 LUMA_CALENDAR_ID = os.getenv('LUMA_CALENDAR_ID')
 LUMA_API_BASE_URL = 'https://public-api.luma.com/v1'
 
-# Approved email domains
-APPROVED_DOMAINS = ['@college.harvard.edu', '@mit.edu', '@harvard.edu']
+# Approval thresholds
+MIN_ATTENDANCE_FOR_APPROVAL = 2   # returning attendee rule
+LAST_MINUTE_HOURS = 24            # verified-student rule window
+LOOKAHEAD_WEEKS = 2               # how far ahead to scan for events
+
+# School email domains. Harvard domains additionally require the address to be
+# in the harvard_students table; MIT domains are trusted on the domain alone.
+HARVARD_DOMAINS = ('@college.harvard.edu', '@harvard.edu')
+MIT_DOMAINS = ('@mit.edu',)
+APPROVED_DOMAINS = HARVARD_DOMAINS + MIT_DOMAINS
 
 # API headers
 HEADERS = {
@@ -95,34 +113,47 @@ def parse_luma_datetime(datetime_str, timezone_str):
 
 def get_luma_events():
     """
-    Fetch all events from Luma API
+    Fetch all events from the Luma calendar, following pagination.
 
     Returns:
-        List of event dictionaries
+        List of event dictionaries, or None if the API call failed
     """
     url = f'{LUMA_API_BASE_URL}/calendar/list-events'
-    params = {'calendar_api_id': LUMA_CALENDAR_ID}
+    events = []
+    next_cursor = None
+    page = 1
 
-    try:
-        response = requests.get(url, headers=HEADERS, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+    while True:
+        params = {'calendar_api_id': LUMA_CALENDAR_ID}
+        if next_cursor:
+            params['pagination_cursor'] = next_cursor
 
-        events = []
+        try:
+            response = requests.get(url, headers=HEADERS, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            logging.error(f"Failed to fetch Luma events (page {page}): {e}")
+            return None
+
         for entry in data.get('entries', []):
             event = entry.get('event', {})
             event['api_id'] = entry.get('api_id')
             events.append(event)
 
-        logging.info(f"Fetched {len(events)} events from Luma")
-        return events
+        if not data.get('has_more', False):
+            break
+        next_cursor = data.get('next_cursor')
+        if not next_cursor:
+            logging.warning("Luma reported has_more=true without next_cursor; stopping pagination")
+            break
+        page += 1
 
-    except Exception as e:
-        logging.error(f"Failed to fetch Luma events: {e}")
-        return []
+    logging.info(f"Fetched {len(events)} events from Luma ({page} page{'s' if page != 1 else ''})")
+    return events
 
 
-def filter_upcoming_events(events, weeks=2):
+def filter_upcoming_events(events, weeks=LOOKAHEAD_WEEKS):
     """
     Filter events happening in the next N weeks
 
@@ -224,48 +255,109 @@ def get_registration_answer(guest_data, question_label):
     return None
 
 
-def check_approved_email(email_str):
+def load_harvard_student_emails(cursor):
     """
-    Check if email is from an approved domain
+    Load the verified Harvard student list from the harvard_students table.
+
+    The table is populated from mailChimp/harvard_students_with_emails.csv by
+    mailChimp/load_harvard_students.py. If the table is missing or empty this
+    returns an empty set, which disables Harvard-email approvals (fail closed)
+    and logs an error so the gap is visible in the pipeline output.
+
+    Returns:
+        set of lowercased email strings
+    """
+    try:
+        cursor.execute("""
+            SELECT LOWER(TRIM(email)), MAX(loaded_at) OVER ()
+            FROM harvard_students
+            WHERE email IS NOT NULL
+        """)
+        rows = cursor.fetchall()
+    except psycopg2.Error as e:
+        # A failed statement aborts the transaction; roll back so later queries work
+        cursor.connection.rollback()
+        logging.error(f"Could not read harvard_students table: {e}")
+        rows = []
+
+    emails = {row[0] for row in rows}
+    if not emails:
+        logging.error(
+            "Harvard student list is EMPTY - Harvard-email approvals are disabled until "
+            "mailChimp/load_harvard_students.py has been run against this database"
+        )
+    else:
+        loaded_at = rows[0][1]
+        logging.info(f"Loaded {len(emails)} verified Harvard student emails (list loaded {loaded_at:%Y-%m-%d})")
+    return emails
+
+
+def classify_email(email_str, harvard_emails):
+    """
+    Decide whether an email counts as a verified Harvard/MIT student email.
 
     Args:
         email_str: Email address to check
+        harvard_emails: set of lowercased emails from the harvard_students table
 
     Returns:
-        True if approved domain, False otherwise
+        (verified: bool, label: str)
     """
     if not email_str:
-        return False
+        return (False, 'no email')
 
-    email_lower = email_str.lower().strip()
-    for domain in APPROVED_DOMAINS:
-        if domain in email_lower:
-            return True
+    email = email_str.lower().strip()
 
-    return False
+    if any(email.endswith(domain) for domain in MIT_DOMAINS):
+        return (True, 'MIT email')
+
+    if any(email.endswith(domain) for domain in HARVARD_DOMAINS):
+        if email in harvard_emails:
+            return (True, 'Harvard email verified in student list')
+        return (False, 'Harvard email NOT in student list')
+
+    return (False, 'not a Harvard/MIT email')
 
 
-def get_harvard_mit_email(guest_data):
+def check_approved_email(email_str, harvard_emails):
+    """Backwards-compatible boolean wrapper around classify_email."""
+    return classify_email(email_str, harvard_emails)[0]
+
+
+def find_verified_school_email(guest_data, person, harvard_emails):
     """
-    Get Harvard/MIT email from guest data (checks main email and school email field)
-
-    Args:
-        guest_data: Guest dictionary from Luma API
+    Look for a verified Harvard/MIT student email across every source we have:
+    the RSVP's main email, the "School email (.edu)" registration answer, and
+    the matched person's emails in the database.
 
     Returns:
-        (has_approved_email: bool, email: str or None)
+        (verified: bool, email: str or None, label: str or None, checks: list[str])
+        `checks` describes every email examined, for logging.
     """
-    # Check main email
-    main_email = guest_data.get('email') or ''
-    if check_approved_email(main_email):
-        return (True, main_email)
+    candidates = [
+        ('main', guest_data.get('email')),
+        ('school', get_registration_answer(guest_data, 'School email (.edu)')),
+    ]
+    if person:
+        candidates.append(('DB school', person.get('school_email')))
+        candidates.append(('DB personal', person.get('personal_email')))
 
-    # Check "School email (.edu)" custom field
-    school_email = get_registration_answer(guest_data, 'School email (.edu)')
-    if school_email and check_approved_email(school_email):
-        return (True, school_email)
+    checks = []
+    seen = set()
+    for source, email in candidates:
+        if not email:
+            continue
+        normalized = email.lower().strip()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
 
-    return (False, None)
+        verified, label = classify_email(email, harvard_emails)
+        checks.append(f"{source}: {normalized} ({label})")
+        if verified:
+            return (True, normalized, label, checks)
+
+    return (False, None, None, checks)
 
 
 def find_person_in_db(cursor, guest_data):
@@ -356,86 +448,63 @@ def find_person_in_db(cursor, guest_data):
     return None
 
 
-def should_approve_rsvp(person, guest_data, event_start_datetime):
+def should_approve_rsvp(person, guest_data, event_start_datetime, harvard_emails):
     """
     Determine if RSVP should be auto-approved
 
     Rules:
     - Approve if person has attended 2+ events, OR
-    - Approve if event starts in ≤24 hours AND person has Harvard/MIT email
+    - Approve if event starts in ≤24 hours AND person has a verified student
+      email (MIT domain, or Harvard domain present in the harvard_students list)
 
     Args:
         person: Person dictionary from database (or None)
         guest_data: Guest dictionary from Luma API
         event_start_datetime: Event start datetime object
+        harvard_emails: set of lowercased verified Harvard student emails
 
     Returns:
         (should_approve: bool, reason: str)
     """
-    # Rule 1: Person has attended 2+ events
-    if person and person.get('attendance_count', 0) >= 2:
+    # Rule 1: Person has attended enough events
+    if person and person.get('attendance_count', 0) >= MIN_ATTENDANCE_FOR_APPROVAL:
         return (True, f"returning attendee ({person['attendance_count']} events)")
 
-    # Rule 2: Event is within 24 hours AND has Harvard/MIT email
+    # Rule 2: Event is within the last-minute window AND verified student email
     now = datetime.now(event_start_datetime.tzinfo)
     hours_until_event = (event_start_datetime - now).total_seconds() / 3600
 
-    if hours_until_event <= 24:
-        # Check if person has Harvard/MIT email from Luma data
-        has_approved_email, approved_email = get_harvard_mit_email(guest_data)
-        if has_approved_email:
-            return (True, f"event in {hours_until_event:.1f}h + Harvard/MIT email")
+    verified, verified_email, label, checks = find_verified_school_email(
+        guest_data, person, harvard_emails
+    )
 
-        # Check if person in DB has Harvard/MIT email
-        if person:
-            if check_approved_email(person.get('school_email')):
-                return (True, f"event in {hours_until_event:.1f}h + Harvard/MIT email (DB)")
-            if check_approved_email(person.get('personal_email')):
-                return (True, f"event in {hours_until_event:.1f}h + Harvard/MIT email (DB)")
+    if hours_until_event <= LAST_MINUTE_HOURS and verified:
+        return (True, f"event in {hours_until_event:.1f}h + {label} ({verified_email})")
 
-    # Build detailed rejection message for verbose mode
+    # Build detailed rejection message
     rejection_parts = []
 
-    # Part 1: Database status
     if person:
-        matched_by = person.get('matched_by', 'unknown')
-        rejection_parts.append(f"found in DB (matched by {matched_by})")
+        rejection_parts.append(f"found in DB (matched by {person.get('matched_by', 'unknown')})")
     else:
         rejection_parts.append("not in DB")
 
-    # Part 2: Attendance status
-    if person:
-        attendance_count = person.get('attendance_count', 0)
-        if attendance_count < 2:
-            rejection_parts.append(f"{attendance_count} event{'s' if attendance_count != 1 else ''} (needs 2+)")
-    else:
-        rejection_parts.append("0 events (needs 2+)")
+    attendance_count = person.get('attendance_count', 0) if person else 0
+    rejection_parts.append(
+        f"{attendance_count} event{'s' if attendance_count != 1 else ''} "
+        f"(needs {MIN_ATTENDANCE_FOR_APPROVAL}+)"
+    )
 
-    # Part 3: Event timing
-    rejection_parts.append(f"event in {hours_until_event:.1f}h (needs ≤24h for Harvard/MIT approval)")
+    rejection_parts.append(
+        f"event in {hours_until_event:.1f}h (needs ≤{LAST_MINUTE_HOURS}h for verified-student approval)"
+    )
 
-    # Part 4: Email check results
-    email_checks = []
-    main_email = guest_data.get('email') or ''
-    school_email_field = get_registration_answer(guest_data, 'School email (.edu)')
-
-    if main_email:
-        email_checks.append(f"main: {main_email}")
-    if school_email_field:
-        email_checks.append(f"school: {school_email_field}")
-    if person:
-        if person.get('school_email'):
-            email_checks.append(f"DB school: {person.get('school_email')}")
-        if person.get('personal_email'):
-            email_checks.append(f"DB personal: {person.get('personal_email')}")
-
-    if email_checks:
-        rejection_parts.append(f"checked emails: {', '.join(email_checks)} - no Harvard/MIT match")
+    if checks:
+        rejection_parts.append("checked emails: " + ", ".join(checks))
     else:
         rejection_parts.append("no emails to check")
 
-    detailed_reason = " | ".join(rejection_parts)
-    return (False, detailed_reason)
+    return (False, " | ".join(rejection_parts))
 
 
 def approve_guest(event_api_id, guest_email, dry_run=False):
@@ -472,18 +541,20 @@ def approve_guest(event_api_id, guest_email, dry_run=False):
         return True
     except Exception as e:
         logging.error(f"Failed to approve {guest_email}: {e}")
-        if hasattr(e, 'response') and hasattr(e.response, 'text'):
-            logging.error(f"Response: {e.response.text}")
+        response = getattr(e, 'response', None)
+        if response is not None and getattr(response, 'text', None):
+            logging.error(f"Response: {response.text}")
         return False
 
 
-def process_event(conn, event, dry_run=False):
+def process_event(conn, event, harvard_emails, dry_run=False):
     """
     Process pending RSVPs for a single event
 
     Args:
         conn: Database connection
         event: Event dictionary with 'api_id', 'name', and 'start_datetime'
+        harvard_emails: set of lowercased verified Harvard student emails
         dry_run: If True, don't actually approve RSVPs
 
     Returns:
@@ -520,14 +591,13 @@ def process_event(conn, event, dry_run=False):
         person = find_person_in_db(cursor, guest_data)
 
         # Determine if should approve
-        should_approve, reason = should_approve_rsvp(person, guest_data, event_start)
+        should_approve, reason = should_approve_rsvp(person, guest_data, event_start, harvard_emails)
 
+        # Decisions are logged at INFO so the cron output shows WHY each RSVP
+        # was or wasn't approved without needing --verbose.
         if should_approve:
-            # Log approval details
-            if person:
-                logging.debug(f"  ✓ {name} ({email}) - {reason} [matched by {person['matched_by']}]")
-            else:
-                logging.debug(f"  ✓ {name} ({email}) - {reason} [not in DB]")
+            matched = f"matched by {person['matched_by']}" if person else "not in DB"
+            logging.info(f"  ✓ {name} ({email}) - {reason} [{matched}]")
 
             # Approve the RSVP
             if approve_guest(event_api_id, email, dry_run):
@@ -535,7 +605,7 @@ def process_event(conn, event, dry_run=False):
             else:
                 stats['errors'] += 1
         else:
-            logging.debug(f"  ✗ {name} ({email}) - {reason}")
+            logging.info(f"  ✗ {name} ({email}) - {reason}")
             stats['skipped'] += 1
 
     cursor.close()
@@ -582,21 +652,31 @@ def main():
 
     # Connect to database
     conn = get_db_connection()
+    exit_code = 0
 
     try:
+        # Load the verified Harvard student list once
+        cursor = conn.cursor()
+        harvard_emails = load_harvard_student_emails(cursor)
+        cursor.close()
+
         # Fetch and filter events
         all_events = get_luma_events()
-        upcoming_events = filter_upcoming_events(all_events, weeks=2)
+        if all_events is None:
+            logging.error("Could not fetch events from Luma - aborting")
+            sys.exit(1)
+
+        upcoming_events = filter_upcoming_events(all_events, weeks=LOOKAHEAD_WEEKS)
 
         if not upcoming_events:
-            logging.info("No upcoming events in next 2 weeks")
+            logging.info(f"No upcoming events in next {LOOKAHEAD_WEEKS} weeks")
             return
 
         # Process each event
         total_stats = {'approved': 0, 'skipped': 0, 'errors': 0}
 
         for event in upcoming_events:
-            stats = process_event(conn, event, dry_run=args.dry_run)
+            stats = process_event(conn, event, harvard_emails, dry_run=args.dry_run)
             total_stats['approved'] += stats['approved']
             total_stats['skipped'] += stats['skipped']
             total_stats['errors'] += stats['errors']
@@ -612,9 +692,14 @@ def main():
         if args.dry_run:
             logging.info("\nThis was a DRY RUN - no approvals were actually executed")
 
+        if total_stats['errors'] > 0:
+            exit_code = 1
+
     finally:
         conn.close()
         logging.info("Database connection closed")
+
+    sys.exit(exit_code)
 
 
 if __name__ == '__main__':

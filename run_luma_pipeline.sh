@@ -1,14 +1,19 @@
 #!/bin/bash
 # Luma Event Sync Pipeline Orchestrator
-# Runs the full pipeline: sync events -> import attendance -> run analytics
-
-set -e  # Exit on error
+# Runs the full pipeline: sync events -> auto-approve RSVPs -> import attendance
+#                         -> analytics -> placards -> Mailchimp sync/tagging
+#
+# Error handling: every step is isolated. A failing step logs a warning, gets
+# recorded, and the pipeline moves on so later steps (attendance import,
+# Mailchimp tagging, ...) still run. At the end the script exits non-zero if
+# any step failed, so Railway shows the cron run as failed and the log gets
+# looked at. Do NOT add `set -e` here: it would abort the whole run on the
+# first failing step and silently skip everything after it.
 
 # Get script directory for relative paths
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# Overlap guard: cron fires every 6 hours regardless of whether the previous
-# run finished. Without this, a slow/hung run causes concurrent pipelines
+# Overlap guard: a slow/hung run must not overlap with the next scheduled run
 # (duplicate imports, port collisions in placard generation, DB contention).
 # flock is available in the Railway container (util-linux); skipped on macOS.
 if command -v flock >/dev/null 2>&1; then
@@ -30,7 +35,19 @@ run_step() {
     fi
 }
 
-# Load environment variables from .env file
+# Failure bookkeeping
+FAILED_STEPS=()
+record_failure() {
+    # $1 = step label, $2 = exit code
+    local detail="exit $2"
+    if [ "$2" -eq 124 ]; then
+        detail="timed out"
+    fi
+    FAILED_STEPS+=("$1 ($detail)")
+    echo "  ⚠️  $1 failed ($detail)"
+}
+
+# Load environment variables from .env file (local runs only; Railway injects env)
 if [ -f "$SCRIPT_DIR/.env" ]; then
     set -a
     source "$SCRIPT_DIR/.env"
@@ -43,34 +60,41 @@ echo "Time: $(date)"
 echo "========================================="
 
 # Step 1: Sync events from Luma API
+#   exit 0 -> new past events need attendance import (JSON list on stdout)
+#   exit 1 -> nothing to import (normal)
+#   exit 2 -> error
 echo ""
 echo "Step 1: Syncing events from Luma API..."
-set +e  # Temporarily allow non-zero exit codes
 events_json=$(run_step 30m python3 "$SCRIPT_DIR/luma_sync.py")
 sync_exit_code=$?
-set -e  # Re-enable exit on error
+case $sync_exit_code in
+    0) echo "Event sync completed - new events need attendance import" ;;
+    1) echo "Event sync completed - no events need attendance import" ;;
+    *) record_failure "Step 1 (luma_sync)" $sync_exit_code ;;
+esac
 
 # Step 2: Auto-approve pending RSVPs for upcoming events
 echo ""
 echo "Step 2: Auto-approving pending RSVPs for upcoming events..."
 run_step 15m python3 "$SCRIPT_DIR/luma/auto_approve_rsvps.py"
-
-if [ $? -eq 0 ]; then
+rc=$?
+if [ $rc -eq 0 ]; then
     echo "RSVP auto-approval completed successfully"
 else
-    echo "Warning: RSVP auto-approval encountered errors"
+    record_failure "Step 2 (auto_approve_rsvps)" $rc
 fi
 
-# Step 3: Import attendance if CSVs were downloaded
+# Steps 3-7 only run when Step 1 found newly finished events
 if [ $sync_exit_code -eq 0 ]; then
+    # Step 3: Import attendance from the downloaded Luma JSON files
     echo ""
-    echo "Step 3: Importing attendance data from Luma CSVs..."
+    echo "Step 3: Importing attendance data from Luma JSON..."
     echo "$events_json" | run_step 30m python3 "$SCRIPT_DIR/import_luma_attendance.py"
-
-    if [ $? -eq 0 ]; then
+    rc=${PIPESTATUS[1]}
+    if [ $rc -eq 0 ]; then
         echo "Attendance import completed successfully"
     else
-        echo "Warning: Attendance import encountered errors"
+        record_failure "Step 3 (import_luma_attendance)" $rc
     fi
 
     # Step 4: Run single event analysis for each newly imported event
@@ -85,7 +109,7 @@ try:
     events = json.load(sys.stdin)
     if events:
         print(' '.join(str(e['event_id']) for e in events))
-except:
+except Exception:
     pass
 ")
 
@@ -93,11 +117,11 @@ except:
         for event_id in $event_ids; do
             echo "  Analyzing event ID: $event_id"
             run_step 15m python3 "$SCRIPT_DIR/event_analysis_single.py" --event-id "$event_id" --outdir "$SCRIPT_DIR/analysis_outputs"
-
-            if [ $? -eq 0 ]; then
+            rc=$?
+            if [ $rc -eq 0 ]; then
                 echo "  ✅ Event $event_id analysis completed"
             else
-                echo "  ⚠️  Event $event_id analysis encountered errors"
+                record_failure "Step 4 (event_analysis_single, event $event_id)" $rc
             fi
         done
     else
@@ -108,39 +132,34 @@ except:
     echo ""
     echo "Step 5: Generating placard PDFs for analyzed events..."
     run_step 60m python3 "$SCRIPT_DIR/generate_all_placards.py" --input-csv "$SCRIPT_DIR/analysis_outputs/event_analysis_all.csv" --placard-dir "$SCRIPT_DIR/placard_generation"
-
-    if [ $? -eq 0 ]; then
+    rc=$?
+    if [ $rc -eq 0 ]; then
         echo "Placard generation completed successfully"
     else
-        echo "Warning: Placard generation encountered errors"
+        record_failure "Step 5 (generate_all_placards)" $rc
     fi
 
     # Step 6: Run comprehensive analytics
     echo ""
     echo "Step 6: Running comprehensive analytics..."
     run_step 30m python3 "$SCRIPT_DIR/analyze.py" --outdir "$SCRIPT_DIR/analysis_outputs"
-
-    if [ $? -eq 0 ]; then
+    rc=$?
+    if [ $rc -eq 0 ]; then
         echo "Analytics completed successfully"
     else
-        echo "Warning: Analytics encountered errors"
+        record_failure "Step 6 (analyze)" $rc
     fi
 
     # Step 7: Sync Mailchimp audience (if credentials are configured)
     echo ""
     echo "Step 7: Syncing Mailchimp audience..."
-
-    # Check if Mailchimp credentials are configured
     if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
-        set +e  # Temporarily allow non-zero exit codes
         run_step 30m python3 "$SCRIPT_DIR/mailChimp/sync_mailchimp_audience.py"
-        mailchimp_exit_code=$?
-        set -e  # Re-enable exit on error
-
-        if [ $mailchimp_exit_code -eq 0 ]; then
+        rc=$?
+        if [ $rc -eq 0 ]; then
             echo "Mailchimp audience sync completed successfully"
         else
-            echo "Warning: Mailchimp audience sync encountered errors"
+            record_failure "Step 7 (sync_mailchimp_audience)" $rc
         fi
     else
         echo "Mailchimp credentials not configured - skipping audience sync"
@@ -148,7 +167,7 @@ except:
     fi
 else
     echo ""
-    echo "Step 3: No events require attendance import (skipping steps 3-7)"
+    echo "Steps 3-7: No events require attendance import (skipping)"
 fi
 
 # Step 8: Tag attendees and RSVP no-shows in Mailchimp for any untagged past events.
@@ -158,31 +177,41 @@ fi
 echo ""
 echo "Step 8: Tagging Mailchimp attendees for untagged past events..."
 if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
-    set +e  # A tagging failure should not abort the pipeline; it will retry next run
     untagged_event_ids=$(run_step 5m python3 "$SCRIPT_DIR/mailChimp/tag_mailchimp_attendees.py" --list-untagged)
-    if [ $? -ne 0 ]; then
-        echo "  ⚠️  Failed to query untagged events"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        record_failure "Step 8 (list untagged events)" $rc
     elif [ -n "$untagged_event_ids" ]; then
         for event_id in $untagged_event_ids; do
             echo "  Tagging attendees and RSVP no-shows in Mailchimp for event $event_id..."
             run_step 15m python3 "$SCRIPT_DIR/mailChimp/tag_mailchimp_attendees.py" --event-id "$event_id"
-
-            if [ $? -eq 0 ]; then
+            rc=$?
+            if [ $rc -eq 0 ]; then
                 echo "  ✅ Event $event_id Mailchimp tagging completed"
             else
-                echo "  ⚠️  Event $event_id Mailchimp tagging encountered errors (will retry next run)"
+                record_failure "Step 8 (tag event $event_id, will retry next run)" $rc
             fi
         done
     else
         echo "  No untagged events - nothing to do"
     fi
-    set -e
 else
     echo "Mailchimp credentials not configured - skipping event tagging"
 fi
 
 echo ""
 echo "========================================="
-echo "Luma Event Sync Pipeline Completed"
-echo "Time: $(date)"
-echo "========================================="
+if [ ${#FAILED_STEPS[@]} -eq 0 ]; then
+    echo "Luma Event Sync Pipeline Completed - all steps succeeded"
+    echo "Time: $(date)"
+    echo "========================================="
+    exit 0
+else
+    echo "Luma Event Sync Pipeline Completed WITH FAILURES:"
+    for step in "${FAILED_STEPS[@]}"; do
+        echo "  - $step"
+    done
+    echo "Time: $(date)"
+    echo "========================================="
+    exit 1
+fi
