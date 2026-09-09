@@ -71,6 +71,12 @@ HEADERS = {
     'content-type': 'application/json'
 }
 
+# One keep-alive session for every Luma call: a single DNS lookup and TLS
+# handshake per run instead of one per request (a flaky resolver otherwise
+# adds its stall to every one of the dozens of calls a run makes).
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
 
 def get_db_connection():
     """Establish database connection"""
@@ -129,7 +135,7 @@ def get_luma_events():
             params['pagination_cursor'] = next_cursor
 
         try:
-            response = requests.get(url, headers=HEADERS, params=params, timeout=30)
+            response = SESSION.get(url, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
         except Exception as e:
@@ -213,7 +219,7 @@ def fetch_pending_rsvps(event_api_id):
             params['pagination_cursor'] = next_cursor
 
         try:
-            response = requests.get(url, headers=HEADERS, params=params, timeout=60)
+            response = SESSION.get(url, params=params, timeout=60)
             response.raise_for_status()
             data = response.json()
 
@@ -535,7 +541,7 @@ def approve_guest(event_api_id, guest_email, dry_run=False):
     }
 
     try:
-        response = requests.post(url, headers=HEADERS, json=payload, timeout=60)
+        response = SESSION.post(url, json=payload, timeout=60)
         response.raise_for_status()
         logging.info(f"Approved: {guest_email}")
         return True
