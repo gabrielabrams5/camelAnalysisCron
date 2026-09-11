@@ -73,7 +73,9 @@ case $sync_exit_code in
     *) record_failure "Step 1 (luma_sync)" $sync_exit_code ;;
 esac
 
-# Step 2: Auto-approve pending RSVPs for upcoming events
+# Step 2: Auto-approve pending RSVPs for upcoming events.
+# Currently PAUSED inside auto_approve_rsvps.py: the script exits 0 without
+# approving anything unless LUMA_AUTO_APPROVE_ENABLED=true is set.
 echo ""
 echo "Step 2: Auto-approving pending RSVPs for upcoming events..."
 run_step 15m python3 "$SCRIPT_DIR/luma/auto_approve_rsvps.py"

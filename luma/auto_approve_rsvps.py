@@ -16,6 +16,10 @@ Rules:
          mailChimp/load_harvard_students.py. A Harvard-looking email that is
          not in the list is NOT approved (fail closed).
 
+PAUSED: approvals are currently switched off. Without
+LUMA_AUTO_APPROVE_ENABLED=true in the environment this script logs that it is
+paused and exits 0 without approving anything.
+
 Usage:
     python3 luma/auto_approve_rsvps.py              # Execute approvals
     python3 luma/auto_approve_rsvps.py --dry-run    # Preview without approving
@@ -52,6 +56,14 @@ DB_CONFIG = {
 LUMA_API_KEY = os.getenv('LUMA_API_KEY')
 LUMA_CALENDAR_ID = os.getenv('LUMA_CALENDAR_ID')
 LUMA_API_BASE_URL = 'https://public-api.luma.com/v1'
+
+# Pause switch. Auto-approval is currently PAUSED: the cron runs this script
+# (pipeline Step 2 and the hourly auto_approve service) but it approves nothing
+# and exits 0. To resume without a code change, set
+# LUMA_AUTO_APPROVE_ENABLED=true in the Railway service Variables tab.
+# --dry-run still works while paused, since it never calls the approval API.
+AUTO_APPROVE_ENABLED = (os.getenv('LUMA_AUTO_APPROVE_ENABLED') or '').strip().lower() \
+    in ('1', 'true', 'yes', 'on')
 
 # Approval thresholds
 MIN_ATTENDANCE_FOR_APPROVAL = 2   # returning attendee rule
@@ -646,6 +658,13 @@ def main():
         level=log_level,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
+
+    # Paused? Do nothing and exit successfully, so the pipeline step doesn't
+    # get recorded as a failure. --dry-run is still allowed (it approves nothing).
+    if not AUTO_APPROVE_ENABLED and not args.dry_run:
+        logging.info("RSVP auto-approval is PAUSED - no RSVPs will be approved.")
+        logging.info("Set LUMA_AUTO_APPROVE_ENABLED=true to resume.")
+        sys.exit(0)
 
     # Validate environment
     if not all([LUMA_API_KEY, LUMA_CALENDAR_ID]):
