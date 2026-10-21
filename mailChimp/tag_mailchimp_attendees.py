@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 import psycopg2
 
 # Import our Mailchimp client module (relative import since we're in the same directory)
-from mailchimp_client import batch_tag_attendees, sanitize_event_name
+from mailchimp_client import batch_tag_attendees, sanitize_event_name, usable_email
 
 # Configure logging
 logging.basicConfig(
@@ -130,11 +130,12 @@ def get_event_attendees(event_id: int) -> tuple[Optional[str], List[Dict[str, st
 
         for row in rows:
             first_name, last_name, email, alt_email, is_first_event = row
+            email, alt_email = usable_email(email, alt_email)
 
-            # Skip if no email available
+            # Skip if no usable email available
             if not email:
                 logging.warning(
-                    f"Skipping {first_name} {last_name} - no email address"
+                    f"Skipping {first_name} {last_name} - no usable email address"
                 )
                 skipped_count += 1
                 continue
@@ -283,11 +284,12 @@ def get_event_rsvp_no_shows(event_id: int) -> List[Dict[str, str]]:
 
         for row in rows:
             first_name, last_name, email, alt_email = row
+            email, alt_email = usable_email(email, alt_email)
 
-            # Skip if no email available
+            # Skip if no usable email available
             if not email:
                 logging.warning(
-                    f"Skipping {first_name} {last_name} - no email address"
+                    f"Skipping {first_name} {last_name} - no usable email address"
                 )
                 skipped_count += 1
                 continue

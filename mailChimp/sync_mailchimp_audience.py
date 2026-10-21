@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 import psycopg2
 
 # Import our Mailchimp client module (relative import since we're in the same directory)
-from mailchimp_client import sync_full_audience
+from mailchimp_client import sync_full_audience, usable_email
 
 # Configure logging
 logging.basicConfig(
@@ -119,6 +119,7 @@ def get_unsynced_contacts() -> Tuple[List[Dict[str, str]], List[int]]:
         for row in rows:
             person_id, first_name, last_name, email, alt_email = row
             person_ids.append(person_id)
+            email, alt_email = usable_email(email, alt_email)
 
             # Each email only once (prevents Mailchimp batch errors)
             if email and email.lower() in seen_emails:

@@ -97,6 +97,23 @@ def _subscriber_hash(email: str) -> str:
     return hashlib.md5(email.strip().lower().encode("utf-8")).hexdigest()
 
 
+def usable_email(email: Optional[str], alt_email: Optional[str]) -> tuple:
+    """
+    Return (email, alt_email) with a junk primary address replaced by the
+    alternate one. Luma registration answers put values like "n/a", "none" or
+    "what is your school email?" into school_email, which Mailchimp rejects.
+    email is None if neither address is usable.
+    """
+    def ok(value):
+        return bool(value) and '@' in value and ' ' not in value.strip()
+
+    if ok(email):
+        return email, (alt_email if ok(alt_email) else None)
+    if ok(alt_email):
+        return alt_email, None
+    return None, None
+
+
 def _member_exists(client, list_id: str, email: str) -> bool:
     """Return True if the email is already a member (any status) of the audience."""
     try:
