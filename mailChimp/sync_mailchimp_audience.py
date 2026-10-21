@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 """
-Standalone script to sync entire mailing list from Railway database to Mailchimp.
+Standalone script to add new people from the Railway database to Mailchimp.
 
 Usage:
     python mailChimp/sync_mailchimp_audience.py
 
 This script:
-1. Queries the Railway PostgreSQL database for all people with emails
-2. Deduplicates using COALESCE(school_email, personal_email) - prefers school email
-3. Syncs all contacts to Mailchimp audience (creates new + updates existing)
+1. Queries the Railway PostgreSQL database for people with emails that have
+   not been synced yet (people.mailchimp_synced_at IS NULL) - i.e. new Google
+   Form signups and first-time Luma RSVPs
+2. Deduplicates using COALESCE(school_email, personal_email) - prefers school email,
+   but uses the person's other address if only that one is already in Mailchimp
+3. Adds them to the Mailchimp audience (status_if_new=subscribed; existing
+   members keep their status) and stamps mailchimp_synced_at
 4. Does NOT remove contacts from Mailchimp if they're removed from database
+
+It deliberately does not re-push people who were synced before: the audience
+is curated by hand in Mailchimp (people removed there must stay removed), so
+only people new to the database are added.
 """
 
 import os
 import sys
 import argparse
 import logging
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from dotenv import load_dotenv
 import psycopg2
 
@@ -56,19 +64,23 @@ def get_db_connection():
         raise ConnectionError(f"Database connection error: {e}")
 
 
-def get_all_contacts() -> List[Dict[str, str]]:
+def get_unsynced_contacts() -> Tuple[List[Dict[str, str]], List[int]]:
     """
-    Query database for all people with email addresses.
+    Query database for people with email addresses that have not been synced
+    to Mailchimp yet (mailchimp_synced_at IS NULL).
 
     Uses COALESCE to prefer school_email over personal_email for deduplication.
     Each unique email address appears only once in the results (even if multiple
     people share the same email). If duplicates exist, keeps the most recent record.
 
     Returns:
-        List of contact dictionaries with:
+        Tuple of (contacts, person_ids) where contacts is a list of dicts with:
             - email: Email address (school_email preferred, unique)
+            - alt_email: Personal email when email is the school email, else None
             - first_name: First name
             - last_name: Last name
+        and person_ids lists every unsynced person (including duplicates
+        collapsed into one contact), to be stamped after a successful sync.
 
     Raises:
         ConnectionError: If database query fails
@@ -80,16 +92,19 @@ def get_all_contacts() -> List[Dict[str, str]]:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Query all people with at least one email
+        # Query unsynced people with at least one email
         # COALESCE prioritizes school_email over personal_email
-        # DISTINCT ON ensures each email appears only once (prevents Mailchimp batch errors)
+        # Ordered so the first row per email is the most recent record
         query = """
-            SELECT DISTINCT ON (COALESCE(school_email, personal_email))
+            SELECT
+                id,
                 first_name,
                 last_name,
-                COALESCE(school_email, personal_email) as email
+                COALESCE(school_email, personal_email) as email,
+                CASE WHEN school_email IS NOT NULL THEN personal_email END as alt_email
             FROM people
-            WHERE school_email IS NOT NULL OR personal_email IS NOT NULL
+            WHERE mailchimp_synced_at IS NULL
+              AND (school_email IS NOT NULL OR personal_email IS NOT NULL)
             ORDER BY COALESCE(school_email, personal_email), id DESC
         """
 
@@ -97,10 +112,17 @@ def get_all_contacts() -> List[Dict[str, str]]:
         rows = cursor.fetchall()
 
         contacts = []
+        person_ids = []
+        seen_emails = set()
         skipped_count = 0
 
         for row in rows:
-            first_name, last_name, email = row
+            person_id, first_name, last_name, email, alt_email = row
+            person_ids.append(person_id)
+
+            # Each email only once (prevents Mailchimp batch errors)
+            if email and email.lower() in seen_emails:
+                continue
 
             # Skip if no email (should not happen due to WHERE clause, but safety check)
             if not email:
@@ -110,18 +132,20 @@ def get_all_contacts() -> List[Dict[str, str]]:
                 skipped_count += 1
                 continue
 
+            seen_emails.add(email.lower())
             contacts.append({
                 'email': email,
+                'alt_email': alt_email,
                 'first_name': first_name,
                 'last_name': last_name
             })
 
         logging.info(
-            f"Found {len(contacts)} contacts with emails "
+            f"Found {len(contacts)} unsynced contacts with emails "
             f"({skipped_count} skipped due to missing email)"
         )
 
-        return contacts
+        return contacts, person_ids
 
     except psycopg2.Error as e:
         logging.error(f"Database query error: {e}")
@@ -134,15 +158,37 @@ def get_all_contacts() -> List[Dict[str, str]]:
             conn.close()
 
 
+def mark_contacts_synced(person_ids: List[int]) -> None:
+    """Stamp people.mailchimp_synced_at so the next run does not re-push them."""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE people
+            SET mailchimp_synced_at = NOW()
+            WHERE id = ANY(%s)
+        """, (person_ids,))
+        conn.commit()
+    except psycopg2.Error as e:
+        raise ConnectionError(f"Failed to mark contacts as synced: {e}")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
 def main():
     """
     Main execution function.
 
-    Parses command-line arguments, queries database, and syncs contacts to Mailchimp.
+    Parses command-line arguments, queries database, and syncs new contacts to Mailchimp.
     """
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
-        description='Sync entire mailing list from Railway database to Mailchimp audience'
+        description='Add people not yet synced from the Railway database to the Mailchimp audience'
     )
     parser.add_argument(
         '--dry-run',
@@ -187,13 +233,14 @@ def main():
         sys.exit(1)
 
     try:
-        # Query database for all contacts
-        logging.info("Querying database for all contacts with emails...")
-        contacts = get_all_contacts()
+        # Query database for contacts not synced yet
+        logging.info("Querying database for unsynced contacts with emails...")
+        contacts, person_ids = get_unsynced_contacts()
 
         if not contacts:
-            logging.warning("No contacts found in database")
-            print("\nNo contacts to sync")
+            print("\nNo new contacts to sync")
+            if person_ids and not args.dry_run:
+                mark_contacts_synced(person_ids)
             sys.exit(0)
 
         # Display summary
@@ -233,6 +280,13 @@ def main():
         if stats['total'] > 0:
             success_rate = (success_count / stats['total']) * 100
             print(f"Success rate: {success_rate:.1f}%")
+
+        # Stamp everyone unless nothing synced at all. Per-member errors are
+        # deterministic data problems (junk emails) that a retry can never fix;
+        # only a total failure (e.g. Mailchimp outage) should leave them NULL
+        # so the next run retries.
+        if success_count > 0 or stats['errors'] == 0:
+            mark_contacts_synced(person_ids)
 
         # Exit with appropriate status code
         if stats['errors'] > 0:

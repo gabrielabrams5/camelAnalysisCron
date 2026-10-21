@@ -93,10 +93,10 @@ Step 6: analyze.py (always runs)
   ├─ Generate analytics graphs
   └─ Save statistics to database
   ↓
-Step 7: sync_mailchimp_audience.py (if Mailchimp configured)
-  ├─ Query all people with emails from database
-  ├─ Deduplicate (prefer school_email over personal_email)
-  └─ Batch sync to Mailchimp audience (add/update contacts)
+Step 7: sync_mailchimp_audience.py (if Mailchimp configured, runs every night)
+  ├─ Query people not yet synced (people.mailchimp_synced_at IS NULL)
+  ├─ Deduplicate (prefer school_email, unless only personal_email is in Mailchimp)
+  └─ Add them to the Mailchimp audience and stamp mailchimp_synced_at
 ```
 
 ## Schedule
@@ -1183,7 +1183,7 @@ Success rate: 100.0%
 
 #### Automated Sync (Cron)
 
-The audience sync automatically runs as **Step 7** of the pipeline cron job (every 6 hours):
+The audience sync automatically runs as **Step 7** of the pipeline cron job. It only pushes people new to the database (`people.mailchimp_synced_at IS NULL`, see `add_mailchimp_sync_state_migration.py`); people already synced are never re-pushed, so contacts removed or moved by hand in Mailchimp stay that way:
 
 ```
 CRON TRIGGER (every 6 hours)
@@ -1194,7 +1194,7 @@ CRON TRIGGER (every 6 hours)
 4. Run event analysis + Tag attendees/no-shows in Mailchimp
 5. Generate placards
 6. Run analytics
-7. Sync Mailchimp audience
+7. Add new people to the Mailchimp audience
 ```
 
 The sync only runs if Mailchimp credentials are configured. If credentials are missing, it will skip gracefully with a message.

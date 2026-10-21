@@ -97,6 +97,43 @@ def _subscriber_hash(email: str) -> str:
     return hashlib.md5(email.strip().lower().encode("utf-8")).hexdigest()
 
 
+def _member_exists(client, list_id: str, email: str) -> bool:
+    """Return True if the email is already a member (any status) of the audience."""
+    try:
+        client.lists.get_list_member(list_id, _subscriber_hash(email), fields=["status"])
+        return True
+    except ApiClientError as e:
+        if getattr(e, 'status_code', None) != 404:
+            logging.warning(f"Could not look up {email} in Mailchimp: {e.text}")
+        return False
+
+
+def use_existing_audience_emails(client, list_id: str, people: List[Dict]) -> List[Dict]:
+    """
+    For people with a second address ('alt_email'), switch 'email' to whichever
+    address is already in the audience, so upserting them never creates a second
+    contact for the same person (e.g. Mailchimp has their personal email while
+    the DB prefers their school email). Returns the list deduplicated by email.
+    """
+    for person in people:
+        alt = person.get('alt_email')
+        email = person.get('email')
+        if not alt or not email or alt.strip().lower() == email.strip().lower():
+            continue
+        if not _member_exists(client, list_id, email) and _member_exists(client, list_id, alt):
+            person['email'] = alt
+
+    deduped = []
+    seen = set()
+    for person in people:
+        key = (person.get('email') or '').strip().lower()
+        if key and key in seen:
+            continue
+        seen.add(key)
+        deduped.append(person)
+    return deduped
+
+
 def batch_tag_attendees(
     attendees: List[Dict[str, str]],
     event_name: str,
@@ -118,6 +155,8 @@ def batch_tag_attendees(
             - first_name: First name (optional)
             - last_name: Last name (optional)
             - is_first_event: Boolean indicating if this is their first event (optional)
+            - alt_email: The person's other address (optional); used instead
+              of email when only alt_email is already in the audience
         event_name: Name of the event (will be sanitized for tag)
         audience_id: Mailchimp audience/list ID (defaults to env var)
         tag_suffix: Suffix for the tag (default: "attended")
@@ -163,6 +202,7 @@ def batch_tag_attendees(
 
     try:
         client = _get_mailchimp_client()
+        attendees = use_existing_audience_emails(client, list_id, attendees)
 
         # Step 1: Batch upsert members
         members_payload = []
@@ -292,6 +332,8 @@ def sync_full_audience(
             - email: Email address (required)
             - first_name: First name (optional)
             - last_name: Last name (optional)
+            - alt_email: The person's other address (optional); used instead
+              of email when only alt_email is already in the audience
         audience_id: Mailchimp audience/list ID (defaults to env var)
         batch_size: Number of contacts to process per batch (max 500)
 
@@ -336,6 +378,7 @@ def sync_full_audience(
 
     try:
         client = _get_mailchimp_client()
+        contacts = use_existing_audience_emails(client, list_id, contacts)
 
         # Process contacts in batches
         for batch_start in range(0, len(contacts), batch_size):

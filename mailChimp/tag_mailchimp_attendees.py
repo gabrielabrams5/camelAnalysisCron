@@ -74,6 +74,7 @@ def get_event_attendees(event_id: int) -> tuple[Optional[str], List[Dict[str, st
     Returns:
         Tuple of (event_name, attendees_list) where attendees_list is a list of dicts with:
             - email: Email address (unique per event)
+            - alt_email: Personal email when email is the school email, else None
             - first_name: First name
             - last_name: Last name
             - is_first_event: Boolean indicating if this is their first event
@@ -111,6 +112,7 @@ def get_event_attendees(event_id: int) -> tuple[Optional[str], List[Dict[str, st
                 p.first_name,
                 p.last_name,
                 COALESCE(p.school_email, p.personal_email) as email,
+                CASE WHEN p.school_email IS NOT NULL THEN p.personal_email END as alt_email,
                 a.is_first_event
             FROM attendance a
             JOIN people p ON a.person_id = p.id
@@ -127,7 +129,7 @@ def get_event_attendees(event_id: int) -> tuple[Optional[str], List[Dict[str, st
         skipped_count = 0
 
         for row in rows:
-            first_name, last_name, email, is_first_event = row
+            first_name, last_name, email, alt_email, is_first_event = row
 
             # Skip if no email available
             if not email:
@@ -149,6 +151,7 @@ def get_event_attendees(event_id: int) -> tuple[Optional[str], List[Dict[str, st
 
             attendees.append({
                 'email': email,
+                'alt_email': alt_email,
                 'first_name': first_name,
                 'last_name': last_name,
                 'is_first_event': is_first_event
@@ -241,6 +244,7 @@ def get_event_rsvp_no_shows(event_id: int) -> List[Dict[str, str]]:
     Returns:
         List of dicts with:
             - email: Email address (unique per event)
+            - alt_email: Personal email when email is the school email, else None
             - first_name: First name
             - last_name: Last name
 
@@ -261,7 +265,8 @@ def get_event_rsvp_no_shows(event_id: int) -> List[Dict[str, str]]:
             SELECT DISTINCT ON (COALESCE(p.school_email, p.personal_email))
                 p.first_name,
                 p.last_name,
-                COALESCE(p.school_email, p.personal_email) as email
+                COALESCE(p.school_email, p.personal_email) as email,
+                CASE WHEN p.school_email IS NOT NULL THEN p.personal_email END as alt_email
             FROM attendance a
             JOIN people p ON a.person_id = p.id
             JOIN events e ON a.event_id = e.id
@@ -277,7 +282,7 @@ def get_event_rsvp_no_shows(event_id: int) -> List[Dict[str, str]]:
         skipped_count = 0
 
         for row in rows:
-            first_name, last_name, email = row
+            first_name, last_name, email, alt_email = row
 
             # Skip if no email available
             if not email:
@@ -299,6 +304,7 @@ def get_event_rsvp_no_shows(event_id: int) -> List[Dict[str, str]]:
 
             rsvp_no_shows.append({
                 'email': email,
+                'alt_email': alt_email,
                 'first_name': first_name,
                 'last_name': last_name
             })

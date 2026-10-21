@@ -90,7 +90,7 @@ else
     record_failure "Step 2 (auto_approve_rsvps)" $rc
 fi
 
-# Steps 3-7 only run when Step 1 found newly finished events
+# Steps 3-6 only run when Step 1 found newly finished events
 if [ $sync_exit_code -eq 0 ]; then
     # Step 3: Import attendance from the downloaded Luma JSON files
     echo ""
@@ -156,24 +156,28 @@ except Exception:
         record_failure "Step 6 (analyze)" $rc
     fi
 
-    # Step 7: Sync Mailchimp audience (if credentials are configured)
-    echo ""
-    echo "Step 7: Syncing Mailchimp audience..."
-    if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
-        run_step 30m python3 "$SCRIPT_DIR/mailChimp/sync_mailchimp_audience.py"
-        rc=$?
-        if [ $rc -eq 0 ]; then
-            echo "Mailchimp audience sync completed successfully"
-        else
-            record_failure "Step 7 (sync_mailchimp_audience)" $rc
-        fi
-    else
-        echo "Mailchimp credentials not configured - skipping audience sync"
-        echo "(Set MAILCHIMP_API_KEY, MAILCHIMP_SERVER_PREFIX, and MAILCHIMP_AUDIENCE_ID to enable)"
-    fi
 else
     echo ""
-    echo "Steps 3-7: No events require attendance import (skipping)"
+    echo "Steps 3-6: No events require attendance import (skipping)"
+fi
+
+# Step 7: Add people new to the database (Google Form signups, first-time RSVPs)
+# to the Mailchimp audience. Runs on EVERY pipeline run so form signups don't
+# wait for the next event import. Only people with people.mailchimp_synced_at
+# NULL are pushed; everyone else is left exactly as curated in Mailchimp.
+echo ""
+echo "Step 7: Adding new contacts to the Mailchimp audience..."
+if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
+    run_step 30m python3 "$SCRIPT_DIR/mailChimp/sync_mailchimp_audience.py"
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "Mailchimp audience sync completed successfully"
+    else
+        record_failure "Step 7 (sync_mailchimp_audience)" $rc
+    fi
+else
+    echo "Mailchimp credentials not configured - skipping audience sync"
+    echo "(Set MAILCHIMP_API_KEY, MAILCHIMP_SERVER_PREFIX, and MAILCHIMP_AUDIENCE_ID to enable)"
 fi
 
 # Step 8: Tag attendees and RSVP no-shows in Mailchimp for any untagged past events.
