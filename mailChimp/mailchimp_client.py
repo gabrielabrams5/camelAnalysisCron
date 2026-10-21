@@ -173,10 +173,12 @@ def batch_tag_attendees(
                 stats['errors'] += 1
                 continue
 
+            # Only set the status for NEW members. Never send "status" here:
+            # with update_existing it would re-subscribe anyone who has
+            # unsubscribed (or been cleaned) the moment they RSVP again.
             member_data = {
                 "email_address": email,
                 "status_if_new": "subscribed",
-                "status": "subscribed",
             }
 
             # Add merge fields if names are provided

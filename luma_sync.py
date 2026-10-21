@@ -194,6 +194,18 @@ def event_exists_in_db(cursor, luma_event_id):
     return False, None, False
 
 
+def get_event_city(luma_event):
+    """
+    City from the event's geo_address_json, or 'TBD'.
+    Luma sends geo_address_json as null for online/unset locations, and as a dict
+    with "city": null for some venues, so both cases need a fallback.
+    """
+    geo_location = luma_event.get('geo_address_json')
+    if not isinstance(geo_location, dict):
+        return 'TBD'
+    return geo_location.get('city') or 'TBD'
+
+
 def create_event(cursor, luma_event):
     """
     Create a new event in the database from Luma event data
@@ -204,15 +216,16 @@ def create_event(cursor, luma_event):
     """
     # Extract and parse fields from Luma event
     # Luma API fields: name, start_at, description, url, api_id, geo_address_json, cover_url, timezone, etc.
-    event_name = luma_event.get('name', 'Untitled Event')
+    # Luma returns explicit nulls for unset fields, so `.get(key, default)` is not
+    # enough - use `or` to fall back when the key is present but null.
+    event_name = luma_event.get('name') or 'Untitled Event'
     timezone_str = luma_event.get('timezone')  # Get timezone from Luma
     start_datetime = parse_luma_datetime(luma_event.get('start_at'), timezone_str)
     description = luma_event.get('description', '')
     signup_url = luma_event.get('url', '')
     cover_image_url = luma_event.get('cover_url', '')
     luma_event_id = luma_event.get('api_id')
-    geo_location = luma_event.get('geo_address_json', {})
-    location_str = geo_location.get('city', 'TBD') if isinstance(geo_location, dict) else 'TBD'
+    location_str = get_event_city(luma_event)
 
     cursor.execute("""
         INSERT INTO events (
@@ -251,17 +264,14 @@ def update_event_if_changed(cursor, db_event_id, luma_event):
         luma_event: Luma event dictionary
     """
     # Extract fields from Luma event
-    event_name = luma_event.get('name', '')[:100]  # Respect VARCHAR(100) limit
+    event_name = (luma_event.get('name') or '')[:100]  # Respect VARCHAR(100) limit
     timezone_str = luma_event.get('timezone')
     start_datetime = parse_luma_datetime(luma_event.get('start_at'), timezone_str)
     description = luma_event.get('description', '')
     signup_url = luma_event.get('url', '')
     cover_image_url = luma_event.get('cover_url', '')
 
-    # Extract location from geo_address_json
-    geo_location = luma_event.get('geo_address_json', {})
-    location_str = geo_location.get('city', 'TBD') if isinstance(geo_location, dict) else 'TBD'
-    location_str = location_str[:100]  # Respect VARCHAR(100) limit
+    location_str = get_event_city(luma_event)[:100]  # Respect VARCHAR(100) limit
 
     # Fetch current values from database
     cursor.execute("""
@@ -373,13 +383,81 @@ def parse_luma_datetime(datetime_str, timezone_str=None):
         return None
 
 
+def sync_one_event(cursor, luma_event, now, six_hours_ago):
+    """
+    Create/update one Luma event in the database and, for a past event whose
+    attendance has not been imported yet, download its guest JSON.
+    Returns: dict describing the event to import, or None
+    """
+    luma_event_id = luma_event.get('api_id')
+    if not luma_event_id:
+        logging.warning(f"Skipping event without ID: {luma_event.get('name', 'Unknown')}")
+        return None
+
+    # Parse event start time with timezone
+    timezone_str = luma_event.get('timezone')
+    start_datetime = parse_luma_datetime(luma_event.get('start_at'), timezone_str)
+    if not start_datetime:
+        logging.warning(f"Skipping event without valid start time: {luma_event.get('name', 'Unknown')}")
+        return None
+
+    # Check if event exists in database
+    exists, db_event_id, attendance_imported = event_exists_in_db(cursor, luma_event_id)
+
+    if start_datetime > now:
+        # Future event - create or update metadata
+        if not exists:
+            create_event(cursor, luma_event)
+        else:
+            update_event_if_changed(cursor, db_event_id, luma_event)
+        return None
+
+    if start_datetime >= six_hours_ago:
+        # Started less than 6 hours ago - wait for check-ins to settle
+        return None
+
+    # Past event (>6 hours old)
+    if not exists:
+        # Create the event first
+        db_event_id = create_event(cursor, luma_event)
+        attendance_imported = False
+
+    if attendance_imported:
+        return None
+
+    # Download JSON to temp file
+    temp_file = tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='.json',
+        delete=False,
+        prefix=f'luma_event_{luma_event_id}_'
+    )
+    temp_path = temp_file.name
+    temp_file.close()
+
+    if not download_event_json(luma_event_id, temp_path):
+        # Clean up temp file if download failed
+        os.unlink(temp_path)
+        return None
+
+    return {
+        'event_id': db_event_id,
+        'json_path': temp_path,
+        'luma_event_id': luma_event_id,
+        'event_name': luma_event.get('name') or 'Unknown'
+    }
+
+
 def sync_events():
     """
     Main sync logic:
     1. Fetch events from Luma
     2. Create/update future events
     3. Download CSVs for past events that need processing
-    Returns: List of events that need attendance import
+
+    Each event runs inside its own savepoint, so one event with unexpected data
+    is logged and skipped instead of rolling back the sync for every event.
+    Returns: (events that need attendance import, names of events that failed)
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -392,65 +470,29 @@ def sync_events():
         six_hours_ago = now - timedelta(hours=6)
 
         events_to_process = []
+        failed_events = []
 
         for luma_event in luma_events:
-            luma_event_id = luma_event.get('api_id')
-            if not luma_event_id:
-                logging.warning(f"Skipping event without ID: {luma_event.get('name', 'Unknown')}")
+            cursor.execute("SAVEPOINT sync_event")
+            try:
+                event_to_process = sync_one_event(cursor, luma_event, now, six_hours_ago)
+            except Exception:
+                cursor.execute("ROLLBACK TO SAVEPOINT sync_event")
+                event_label = f"{luma_event.get('name') or 'Unknown'} ({luma_event.get('api_id')})"
+                logging.exception(f"Failed to sync event {event_label} - skipping it")
+                failed_events.append(event_label)
                 continue
-
-            # Parse event start time with timezone
-            timezone_str = luma_event.get('timezone')
-            start_datetime = parse_luma_datetime(luma_event.get('start_at'), timezone_str)
-            if not start_datetime:
-                logging.warning(f"Skipping event without valid start time: {luma_event.get('name', 'Unknown')}")
-                continue
-
-            # Check if event exists in database
-            exists, db_event_id, attendance_imported = event_exists_in_db(cursor, luma_event_id)
-
-            if start_datetime > now:
-                # Future event - create or update metadata
-                if not exists:
-                    create_event(cursor, luma_event)
-                else:
-                    update_event_if_changed(cursor, db_event_id, luma_event)
-
-            elif start_datetime < six_hours_ago:
-                # Past event (>6 hours old)
-                if not exists:
-                    # Create the event first
-                    db_event_id = create_event(cursor, luma_event)
-                    attendance_imported = False
-
-                # Check if needs attendance processing
-                if not attendance_imported:
-                    # Download JSON to temp file
-                    temp_file = tempfile.NamedTemporaryFile(
-                        mode='w',
-                        suffix='.json',
-                        delete=False,
-                        prefix=f'luma_event_{luma_event_id}_'
-                    )
-                    temp_path = temp_file.name
-                    temp_file.close()
-
-                    if download_event_json(luma_event_id, temp_path):
-                        events_to_process.append({
-                            'event_id': db_event_id,
-                            'json_path': temp_path,
-                            'luma_event_id': luma_event_id,
-                            'event_name': luma_event.get('name', 'Unknown')
-                        })
-                    else:
-                        # Clean up temp file if download failed
-                        os.unlink(temp_path)
+            cursor.execute("RELEASE SAVEPOINT sync_event")
+            if event_to_process:
+                events_to_process.append(event_to_process)
 
         # Commit all database changes
         conn.commit()
         logging.info(f"Sync complete. Found {len(events_to_process)} events needing attendance import.")
+        if failed_events:
+            logging.error(f"{len(failed_events)} event(s) failed to sync: {', '.join(failed_events)}")
 
-        return events_to_process
+        return events_to_process, failed_events
 
     except Exception as e:
         conn.rollback()
@@ -462,14 +504,23 @@ def sync_events():
 
 
 def main():
-    """Main entry point"""
+    """
+    Main entry point. Exit codes (read by run_luma_pipeline.sh):
+      0 -> events need attendance import (JSON list on stdout)
+      1 -> nothing to import
+      2 -> error, nothing to import
+      3 -> events need attendance import (JSON list on stdout), but some
+           events failed to sync
+    """
     try:
-        events_to_process = sync_events()
+        events_to_process, failed_events = sync_events()
 
         if events_to_process:
             # Output JSON list for next stage of pipeline
             print(json.dumps(events_to_process, indent=2))
-            sys.exit(0)  # Exit code 0 means there are events to process
+            sys.exit(3 if failed_events else 0)
+        elif failed_events:
+            sys.exit(2)
         else:
             # No events to process
             logging.info("No events need attendance import at this time.")

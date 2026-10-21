@@ -63,6 +63,7 @@ echo "========================================="
 #   exit 0 -> new past events need attendance import (JSON list on stdout)
 #   exit 1 -> nothing to import (normal)
 #   exit 2 -> error
+#   exit 3 -> some events failed to sync, but others still need import
 echo ""
 echo "Step 1: Syncing events from Luma API..."
 events_json=$(run_step 30m python3 "$SCRIPT_DIR/luma_sync.py")
@@ -70,6 +71,9 @@ sync_exit_code=$?
 case $sync_exit_code in
     0) echo "Event sync completed - new events need attendance import" ;;
     1) echo "Event sync completed - no events need attendance import" ;;
+    3) record_failure "Step 1 (luma_sync, some events skipped)" $sync_exit_code
+       echo "Continuing with the events that did sync"
+       sync_exit_code=0 ;;
     *) record_failure "Step 1 (luma_sync)" $sync_exit_code ;;
 esac
 
