@@ -2,6 +2,7 @@
 # Luma Event Sync Pipeline Orchestrator
 # Runs the full pipeline: sync events -> auto-approve RSVPs -> import attendance
 #                         -> analytics -> placards -> Mailchimp sync/tagging
+#                         -> Camel balance from the weekly QuickBooks P&L
 #
 # Error handling: every step is isolated. A failing step logs a warning, gets
 # recorded, and the pipeline moves on so later steps (attendance import,
@@ -207,6 +208,26 @@ if [ -n "$MAILCHIMP_API_KEY" ] && [ -n "$MAILCHIMP_AUDIENCE_ID" ]; then
     fi
 else
     echo "Mailchimp credentials not configured - skipping event tagging"
+fi
+
+# Step 9: Track The Camel's balance and expenses. Hillel no longer sends
+# balance reports, so the balance is rolled forward from the weekly QuickBooks
+# "Camel P&L by Month" email: this fiscal year's opening balance + net income
+# so far. Runs on EVERY pipeline run and imports any report email not seen
+# before (self-healing); fails if no new report has arrived in 9+ days.
+echo ""
+echo "Step 9: Updating The Camel's balance from QuickBooks P&L emails..."
+if [ -n "$GMAIL_REFRESH_TOKEN" ]; then
+    run_step 10m python3 "$SCRIPT_DIR/finance/track_balance.py"
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "Balance tracking completed successfully"
+    else
+        record_failure "Step 9 (track_balance)" $rc
+    fi
+else
+    echo "Gmail credentials not configured - skipping balance tracking"
+    echo "(Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, and GMAIL_REFRESH_TOKEN to enable)"
 fi
 
 echo ""

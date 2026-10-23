@@ -55,6 +55,22 @@ All files are saved to a persistent Railway volume for long-term storage.
 - **Automatic**: Runs every 6 hours as part of the cron pipeline (if Mailchimp credentials are configured)
 - **Manual**: Can also be run standalone anytime for immediate sync
 
+### 5. **Camel Balance Tracking** (`finance/track_balance.py`)
+- Hillel stopped sending balance reports (Oct 2026), so the balance is rolled forward from the weekly QuickBooks email *"Camel P&L by Month updated weekly"* (sent Sundays):
+  - **balance = this fiscal year's opening balance + net income so far this fiscal year** (FY27 = July 2026 – June 2027)
+  - Each report restates the whole fiscal year, so expenses booked late into an earlier month are picked up automatically
+- Reads Gmail (read-only, Trash included) for QuickBooks report emails not seen before and stores each P&L's year-to-date totals and per-account figures in `camel_pl_reports`
+- Logs the balance and what changed since the previous report (income, expenses, per account)
+- **Fails the run** if no new P&L has arrived for 9+ days, since a stopped QuickBooks schedule otherwise looks like a quiet week
+- Opening balances live in `camel_fiscal_years` and are never committed (public repo). `camel_balance_history` is a view of the balance after every report
+- One-time setup:
+  ```bash
+  python3 add_camel_finance_migration.py
+  python3 finance/track_balance.py --set-opening FY27 <Beginning Balance from Hillel's roll-forward report> --source "Hillel roll-forward report as of 2026-10-18"
+  python3 finance/gmail_auth.py   # mints GMAIL_REFRESH_TOKEN into .env; see its docstring
+  ```
+- Other commands: `--dry-run` (roll back all writes), `--no-gmail` (balance from stored reports only), `--import-file report.xlsx` (import a saved P&L workbook, e.g. a week the email was lost)
+
 ## Pipeline Execution Flow
 
 ```
@@ -97,6 +113,11 @@ Step 7: sync_mailchimp_audience.py (if Mailchimp configured, runs every night)
   ├─ Query people not yet synced (people.mailchimp_synced_at IS NULL)
   ├─ Deduplicate (prefer school_email, unless only personal_email is in Mailchimp)
   └─ Add them to the Mailchimp audience and stamp mailchimp_synced_at
+  ↓
+Step 9: finance/track_balance.py (if Gmail configured, runs every night)
+  ├─ Import QuickBooks "Camel P&L by Month" emails not seen before
+  ├─ Balance = fiscal-year opening balance + net income year to date
+  └─ Fail the run if the newest P&L is more than 9 days old
 ```
 
 ## Schedule
@@ -332,7 +353,14 @@ docker run -v $(pwd)/analysis_outputs:/app/analysis_outputs event-analytics
 | `MAILCHIMP_SERVER_PREFIX` | Mailchimp server prefix from API key | `us21` | No* |
 | `MAILCHIMP_AUDIENCE_ID` | Mailchimp audience/list ID | `a1b2c3d4e5` | No* |
 
+| `GMAIL_CLIENT_ID` | OAuth client (type "Desktop app") for reading the QuickBooks P&L email | `123-abc.apps.googleusercontent.com` | No† |
+| `GMAIL_CLIENT_SECRET` | Secret of that OAuth client | `GOCSPX-...` | No† |
+| `GMAIL_REFRESH_TOKEN` | Read-only Gmail refresh token from `finance/gmail_auth.py` | `1//0g...` | No† |
+| `QBO_REPORT_QUERY` | Override the Gmail search for QuickBooks report emails | `from:quickbooks@notification.intuit.com subject:Camel has:attachment newer_than:120d` | No |
+
 \* Required only if using Mailchimp integration (`mailChimp/tag_mailchimp_attendees.py`)
+
+† Required only for balance tracking (Step 9, `finance/track_balance.py`)
 
 ## Database Migration
 

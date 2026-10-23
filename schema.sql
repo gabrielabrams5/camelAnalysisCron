@@ -75,6 +75,75 @@ CREATE TABLE IF NOT EXISTS attendance (
 
 
 -- ============================================
+-- TABLE: camel_fiscal_years
+-- ============================================
+-- Opening balance of each Hillel fiscal year (July-June, named for the year
+-- it ends: FY27 = 2027). Recorded with finance/track_balance.py --set-opening,
+-- never committed (public repo). Created by add_camel_finance_migration.py.
+
+CREATE TABLE IF NOT EXISTS camel_fiscal_years (
+    fiscal_year SMALLINT PRIMARY KEY,
+    opening_balance NUMERIC(12,2) NOT NULL,
+    source TEXT NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+-- ============================================
+-- TABLE: camel_pl_reports
+-- ============================================
+-- One row per QuickBooks report email (source_id = Gmail message id) or
+-- manually imported workbook (source_id = 'file:<sha256>'). 'imported' rows
+-- hold a weekly P&L's fiscal-year-to-date totals and per-account figures;
+-- 'skipped' rows are other QuickBooks attachments, kept so they are not
+-- fetched again. Written by finance/track_balance.py (pipeline Step 9).
+
+CREATE TABLE IF NOT EXISTS camel_pl_reports (
+    id SERIAL PRIMARY KEY,
+    source_id VARCHAR(100) UNIQUE NOT NULL,
+    status VARCHAR(10) NOT NULL,
+    subject TEXT,
+    received_at TIMESTAMPTZ,
+    filename TEXT,
+    period_start DATE,
+    as_of_date DATE,
+    fiscal_year SMALLINT,
+    total_income NUMERIC(12,2),
+    total_expenses NUMERIC(12,2),
+    net_income NUMERIC(12,2),
+    accounts JSONB,
+    imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (status IN ('imported', 'skipped')),
+    CHECK (status = 'skipped' OR (as_of_date IS NOT NULL
+                                  AND fiscal_year IS NOT NULL
+                                  AND net_income IS NOT NULL))
+);
+
+CREATE INDEX idx_camel_pl_reports_as_of ON public.camel_pl_reports USING btree (fiscal_year, as_of_date);
+
+
+-- ============================================
+-- VIEW: camel_balance_history
+-- ============================================
+-- The Camel's balance after every imported P&L:
+-- opening balance of its fiscal year + net income so far that year.
+
+CREATE OR REPLACE VIEW camel_balance_history AS
+SELECT
+    r.as_of_date,
+    r.fiscal_year,
+    f.opening_balance,
+    r.total_income,
+    r.total_expenses,
+    r.net_income,
+    f.opening_balance + r.net_income AS balance,
+    r.source_id
+FROM camel_pl_reports r
+JOIN camel_fiscal_years f ON f.fiscal_year = r.fiscal_year
+WHERE r.status = 'imported';
+
+
+-- ============================================
 -- TABLE: events
 -- ============================================
 

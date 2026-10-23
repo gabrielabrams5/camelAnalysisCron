@@ -63,6 +63,7 @@ COPY run_luma_pipeline.sh .
 # Copy directories
 COPY luma/ /app/luma/
 COPY mailChimp/ /app/mailChimp/
+COPY finance/ /app/finance/
 COPY placard_generation/ /app/placard_generation/
 
 # Install Node.js dependencies for placard generation

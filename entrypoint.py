@@ -68,6 +68,9 @@ def main():
 
     mailchimp_ready = bool(os.getenv('MAILCHIMP_API_KEY') and os.getenv('MAILCHIMP_AUDIENCE_ID'))
     log(f"  MAILCHIMP_*: {'SET' if mailchimp_ready else 'NOT_SET (Mailchimp steps will be skipped)'}")
+    gmail_ready = bool(os.getenv('GMAIL_CLIENT_ID') and os.getenv('GMAIL_CLIENT_SECRET')
+                       and os.getenv('GMAIL_REFRESH_TOKEN'))
+    log(f"  GMAIL_*: {'SET' if gmail_ready else 'NOT_SET (balance tracking will be skipped)'}")
     log("")
 
     if missing:
