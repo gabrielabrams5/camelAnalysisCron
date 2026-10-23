@@ -10,9 +10,11 @@ that Sunday). So after any report:
 
     balance = opening balance of the fiscal year + net income so far this FY
 
-which reproduces the accountant's figure for 10/18 exactly. Because each report
-restates the whole year, an expense booked late into an earlier month is picked
-up by the next report automatically.
+which is the same roll-forward Hillel's accountant uses. The email is a
+Sunday-morning snapshot, so an entry posted later but dated that week shows up
+in the next week's report (each report restates the whole year); e.g. the
+10/18 email was short of the accountant's 10/21 run of the same period by a
+contribution and two card charges posted after Sunday.
 
 Each run (Step 9 of run_luma_pipeline.sh):
 1. Searches Gmail - Trash included, since camelManagement bins the QuickBooks
@@ -22,7 +24,10 @@ Each run (Step 9 of run_luma_pipeline.sh):
    report) are recorded as 'skipped' so they are not fetched again. A report
    that fails to import is not recorded, so the next run retries it.
 2. Logs the current balance and what changed since the previous report.
-3. Exits 1 if the newest report is more than STALE_AFTER_DAYS old: a stopped
+3. The first time a report is the newest one, emails that summary from the
+   same Gmail account to BALANCE_EMAIL_TO (comma-separated; default: the
+   mailbox itself; "none" turns it off). A failed send is retried next run.
+4. Exits 1 if the newest report is more than STALE_AFTER_DAYS old: a stopped
    QuickBooks schedule otherwise looks exactly like a quiet week.
 
 Opening balances live in camel_fiscal_years, never in this repo (it is public).
@@ -35,18 +40,21 @@ Usage:
     python3 finance/track_balance.py --dry-run          # same, roll back all writes
     python3 finance/track_balance.py --no-gmail         # log balance from stored reports
     python3 finance/track_balance.py --import-file X.xlsx   # import a saved P&L workbook
+    python3 finance/track_balance.py --no-gmail --email-latest   # re-send the newest summary
     python3 finance/track_balance.py --set-opening FY27 <amount> --source "where it came from"
 
 Needs the PG* variables, and GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET /
-GMAIL_REFRESH_TOKEN for the Gmail search (see finance/gmail_auth.py).
+GMAIL_REFRESH_TOKEN for the Gmail search and the email (see finance/gmail_auth.py).
 Tables are created by add_camel_finance_migration.py.
 """
 
 import argparse
 import hashlib
+import html
 import json
 import logging
 import os
+import re
 import sys
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -95,6 +103,11 @@ def check_tables(cur):
     if None in cur.fetchone():
         raise SetupError("camel_pl_reports / camel_fiscal_years do not exist - "
                          "run add_camel_finance_migration.py first")
+    cur.execute("SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'camel_pl_reports' AND column_name = 'emailed_at'")
+    if not cur.fetchone():
+        raise SetupError("camel_pl_reports.emailed_at does not exist - "
+                         "re-run add_camel_finance_migration.py")
 
 
 def money(x: Decimal) -> str:
@@ -277,12 +290,12 @@ def account_changes(latest_accounts, previous_accounts):
 
 
 def report_balance(conn):
-    """Log the balance. Returns (ok, stale)."""
+    """Log the balance. Returns (ok, stale, summary); summary is None when there is no balance."""
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     latest = latest_report(cur)
     if not latest:
         logging.warning("No P&L report imported yet - no balance to report")
-        return True, True
+        return True, True, None
 
     fy = latest['fiscal_year']
     opening = opening_balance(cur, fy)
@@ -290,31 +303,257 @@ def report_balance(conn):
         logging.error(f"No opening balance recorded for {fy_label(fy)}. Record it from Hillel's "
                       f"roll-forward report:\n  python3 finance/track_balance.py --set-opening "
                       f"{fy_label(fy)} <amount> --source \"...\"")
-        return False, False
+        return False, False, None
     amount, source = opening
     balance = amount + latest['net_income']
 
-    logging.info("")
-    logging.info(f"The Camel's balance as of {day(latest['as_of_date'])}: {money(balance)}")
-    logging.info(f"  {fy_label(fy)} opening balance  {money(amount):>14}   ({source})")
-    logging.info(f"  + income this FY      {money(latest['total_income']):>14}")
-    logging.info(f"  - expenses this FY    {money(latest['total_expenses']):>14}")
-
     previous = latest_report(cur, fiscal_year=fy, before=latest['as_of_date'])
-    if previous:
-        logging.info(f"Since the {day(previous['as_of_date'])} report: "
-                     f"income {signed(latest['total_income'] - previous['total_income'])}, "
-                     f"expenses {signed(latest['total_expenses'] - previous['total_expenses'])}")
-        for section, account, delta in account_changes(latest['accounts'], previous['accounts']):
-            kind = 'income' if section in ('income', 'other_income') else 'expense'
-            logging.info(f"    {kind:<8} {account:<45} {signed(delta):>14}")
+    changes = account_changes(latest['accounts'], previous['accounts']) if previous else []
+    cur.execute("""
+        SELECT DISTINCT ON (as_of_date) as_of_date, net_income FROM camel_pl_reports
+        WHERE status = 'imported' AND fiscal_year = %s
+        ORDER BY as_of_date, received_at DESC NULLS LAST, id DESC
+    """, (fy,))
+    history = [(r['as_of_date'], amount + r['net_income']) for r in cur.fetchall()]
+    summary = {'latest': latest, 'previous': previous, 'fiscal_year': fy, 'opening': amount,
+               'source': source, 'balance': balance, 'changes': changes, 'history': history}
+
+    logging.info("")
+    for line in summary_lines(summary):
+        logging.info(line)
 
     age = (date.today() - latest['as_of_date']).days
     stale = age > STALE_AFTER_DAYS
     if stale:
         logging.warning(f"The newest P&L is {age} days old. QuickBooks should send one every Sunday "
                         f"('Camel P&L by Month updated weekly') - check the schedule with Hillel.")
-    return True, stale
+    return True, stale, summary
+
+
+def summary_lines(s):
+    latest, previous = s['latest'], s['previous']
+    lines = [
+        f"The Camel's balance as of {day(latest['as_of_date'])}: {money(s['balance'])}",
+        f"  {fy_label(s['fiscal_year'])} opening balance  {money(s['opening']):>14}   ({s['source']})",
+        f"  + income this FY      {money(latest['total_income']):>14}",
+        f"  - expenses this FY    {money(latest['total_expenses']):>14}",
+    ]
+    if previous:
+        lines.append(f"Since the {day(previous['as_of_date'])} report: "
+                     f"income {signed(latest['total_income'] - previous['total_income'])}, "
+                     f"expenses {signed(latest['total_expenses'] - previous['total_expenses'])}")
+        for section, account, delta in s['changes']:
+            lines.append(f"    {kind_of(section):<8} {account:<45} {signed(delta):>14}")
+    return lines
+
+
+def kind_of(section):
+    return 'income' if section in ('income', 'other_income') else 'expense'
+
+
+# ---------------------------------------------------------------------------
+# Emailing the summary
+# ---------------------------------------------------------------------------
+
+EMAIL_FOOTER = ("Balance = this fiscal year's opening balance (from Hillel's roll-forward report) "
+                "+ income - expenses so far this fiscal year, from QuickBooks' weekly "
+                "\"Camel P&L by Month\" report. Entries posted after Sunday morning but dated "
+                "earlier show up in the next week's report. Sent by camelAnalysisCron (Step 9).")
+
+# How many weekly balances the email lists (newest last).
+EMAIL_HISTORY_ROWS = 10
+
+
+def account_name(label: str) -> str:
+    """'610030 Food and Beverage' -> 'Food and Beverage'."""
+    code, _, name = label.partition(' ')
+    return name if code.isdigit() and name else label
+
+
+def month_start(label: str) -> date:
+    """A report's month column ('Jul 2026', 'Oct 1-18 2026') -> its first day, for sorting."""
+    parts = label.split()
+    try:
+        return datetime.strptime(f"{parts[0][:3]} {parts[-1]}", '%b %Y').date()
+    except (ValueError, IndexError):
+        return date.max
+
+
+def short_day(d: date) -> str:
+    return f"{d:%b} {d.day}"
+
+
+def email_figures(s):
+    """Everything the email shows beyond the totals, worked out from the newest report."""
+    latest, previous = s['latest'], s['previous']
+    accounts = latest['accounts'] or []
+    is_income = lambda a: a.get('section') in ('income', 'other_income')
+    cents = Decimal('0.01')
+
+    categories = sorted(((account_name(a['account']), Decimal(str(a['total'])).quantize(cents))
+                         for a in accounts if not is_income(a)), key=lambda c: -c[1])
+
+    months = {}
+    for a in accounts:
+        for label, value in (a.get('months') or {}).items():
+            m = months.setdefault(label, {'received': Decimal('0'), 'spent': Decimal('0')})
+            m['received' if is_income(a) else 'spent'] += Decimal(str(value))
+    by_month = [(label, m['received'].quantize(cents), m['spent'].quantize(cents))
+                for label, m in sorted(months.items(), key=lambda kv: month_start(kv[0]))]
+
+    # Pace: average spending over complete months only ("Oct 1-18 2026" is partial).
+    full = [(label, spent) for label, _, spent in by_month if re.fullmatch(r'[A-Z][a-z]+ \d{4}', label)]
+    pace = (sum(spent for _, spent in full) / len(full)).quantize(cents) if full else None
+    pace_span = f"{full[0][0].split()[0]}–{full[-1][0]}" if len(full) > 1 else (full[0][0] if full else '')
+
+    received, spent, refunds, corrections = [], [], [], []
+    for section, account, delta in s['changes']:
+        name = account_name(account)
+        if kind_of(section) == 'income':
+            (received if delta > 0 else corrections).append((name, delta))
+        else:
+            (spent if delta > 0 else refunds).append((name, delta))
+
+    balance_change = latest['net_income'] - previous['net_income'] if previous else None
+    return {'categories': categories, 'by_month': by_month, 'pace': pace, 'pace_span': pace_span,
+            'received': received, 'spent': spent, 'refunds': refunds, 'corrections': corrections,
+            'balance_change': balance_change}
+
+
+def render_email(s):
+    """(subject, text, html) for the summary of the newest report."""
+    latest, previous = s['latest'], s['previous']
+    as_of = latest['as_of_date']
+    f = email_figures(s)
+    fy = fy_label(s['fiscal_year'])
+    total_spent = latest['total_expenses']
+
+    moved = ''
+    if previous:
+        change = f['balance_change']
+        moved = (f"{'up' if change >= 0 else 'down'} {money(abs(change))} since the "
+                 f"{short_day(previous['as_of_date'])} report")
+    subject = f"Camel balance {money(s['balance'])} as of {short_day(as_of)}" + (f", {moved}" if moved else '')
+
+    # Each section is (heading, intro or None, rows, last row is a total); a row is (label, value, note).
+    sections = [(f"{fy} so far (July 1 – {short_day(as_of)})", None, [
+        ('Opening balance, July 1', money(s['opening']), ''),
+        ('+ Received', money(latest['total_income']), ''),
+        ('− Spent', money(total_spent), ''),
+        ('= Balance', money(s['balance']), ''),
+    ], True)]
+
+    if previous:
+        rows = []
+        for title, items, show in (('Received', f['received'], money),
+                                   ('Spent', f['spent'], money),
+                                   ('Refunds', f['refunds'], lambda d: money(-d)),
+                                   ('Income corrections', f['corrections'], signed)):
+            rows += [(f"{title}: {name}", show(delta), '') for name, delta in items]
+        if not rows:
+            rows = [('No changes', '', '')]
+        sections.append((f"Since the {short_day(previous['as_of_date'])} report",
+                         "Includes anything booked this week, even if it is dated earlier.", rows, False))
+
+    sections.append((f"Spending by category, {fy} so far", None, [
+        (name, money(total), (f"{total / total_spent:.0%}" if total / total_spent >= Decimal('0.005') else '<1%')
+         if total_spent and total > 0 else '')
+        for name, total in f['categories']], False))
+
+    sections.append(("By month", "Received / spent / net. The current month is partial.", [
+        (label, f"{money(rec)} / {money(sp)}", signed(rec - sp)) for label, rec, sp in f['by_month']], False))
+
+    history = s.get('history') or []
+    if len(history) > 1:
+        rows = [(day(d), money(b), signed(b - history[i - 1][1]) if i else '')
+                for i, (d, b) in enumerate(history)]
+        sections.append(("Balance after each weekly report", None, rows[-EMAIL_HISTORY_ROWS:], False))
+
+    pace_line = ''
+    if f['pace'] and f['pace'] > 0:
+        pace_line = f"Spending averaged {money(f['pace'])} a month over {f['pace_span']} (complete months)."
+        if s['balance'] > 0:
+            pace_line += (f" At that rate the balance covers about {s['balance'] / f['pace']:.1f} months "
+                          "of spending, before any new income.")
+
+    headline = f"The Camel's balance as of {day(as_of)}: {money(s['balance'])}" + (f" ({moved})" if moved else '')
+
+    # Plain-text version
+    text = [headline, '']
+    if pace_line:
+        text += [pace_line, '']
+    for heading, intro, rows, _ in sections:
+        text.append(heading.upper())
+        if intro:
+            text.append(intro)
+        width = max((len(label) for label, _, _ in rows), default=0)
+        text += [f"  {label:<{width}}  {value:>14}  {note}".rstrip() for label, value, note in rows]
+        text.append('')
+    text.append(EMAIL_FOOTER)
+    text = '\n'.join(text) + '\n'
+
+    # HTML version
+    esc = html.escape
+    cell = 'padding:3px 16px 3px 0;vertical-align:top;'
+    num = cell + 'text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;'
+    muted = 'color:#6b6b6b;'
+    parts = [f'<p style="font-size:20px;margin:0 0 4px">The Camel\'s balance as of {esc(day(as_of))}: '
+             f'<b>{esc(money(s["balance"]))}</b></p>']
+    if moved:
+        parts.append(f'<p style="margin:0 0 12px;{muted}">{esc(moved[0].upper() + moved[1:])}</p>')
+    if pace_line:
+        parts.append(f'<p style="margin:0 0 16px">{esc(pace_line)}</p>')
+    for heading, intro, rows, total_last in sections:
+        parts.append(f'<h3 style="font-size:15px;margin:20px 0 4px">{esc(heading)}</h3>')
+        if intro:
+            parts.append(f'<p style="margin:0 0 6px;font-size:13px;{muted}">{esc(intro)}</p>')
+        body = ''
+        for i, (label, value, note) in enumerate(rows):
+            strong = 'font-weight:600;border-top:1px solid #ccc;' if total_last and i == len(rows) - 1 else ''
+            body += (f'<tr><td style="{cell}{strong}">{esc(label)}</td><td style="{num}{strong}">{esc(value)}</td>'
+                     f'<td style="{num}{muted}{strong}">{esc(note)}</td></tr>')
+        parts.append(f'<table style="border-collapse:collapse;font-size:14px">{body}</table>')
+    parts.append(f'<p style="margin:20px 0 0;font-size:12px;{muted}">{esc(EMAIL_FOOTER)}</p>')
+    html_body = ('<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#222;'
+                 'max-width:640px">' + ''.join(parts) + '</div>')
+    return subject, text, html_body
+
+
+def email_new_report(conn, gmail: GmailClient, summary, dry_run: bool, force: bool = False) -> int:
+    """
+    Email the newest report's summary once, after it is first imported. Returns
+    the number of failures. A failed send leaves emailed_at NULL, so the next
+    run retries it; older reports imported in the same run are covered by the
+    one email. force sends it again even if it was already emailed.
+    """
+    setting = (os.getenv('BALANCE_EMAIL_TO') or '').strip()
+    if summary is None or (setting.lower() in ('none', 'off') and not force):
+        return 0
+    if setting.lower() in ('none', 'off'):
+        setting = ''
+    cur = conn.cursor()
+    cur.execute("SELECT count(*) FROM camel_pl_reports WHERE status = 'imported' AND emailed_at IS NULL")
+    if not cur.fetchone()[0] and not force:
+        return 0
+
+    if summary['latest']['emailed_at'] is None or force:
+        try:
+            to = [a.strip() for a in setting.split(',') if a.strip()] or [gmail.mailbox()]
+            subject, text, html_body = render_email(summary)
+            if dry_run:
+                logging.info(f"Dry run - would email {', '.join(to)}: {subject!r}")
+                return 0
+            gmail.send(to, subject, text, html_body)
+            logging.info(f"Emailed the summary to {', '.join(to)}: {subject!r}")
+        except Exception as e:
+            logging.error(f"Could not email the summary (will retry next run): {e}")
+            return 1
+
+    if not dry_run:
+        cur.execute("UPDATE camel_pl_reports SET emailed_at = NOW() "
+                    "WHERE status = 'imported' AND emailed_at IS NULL")
+        conn.commit()
+    return 0
 
 
 def main() -> int:
@@ -326,6 +565,8 @@ def main() -> int:
     mode.add_argument('--set-opening', nargs=2, metavar=('FISCAL_YEAR', 'AMOUNT'),
                       help="Record a fiscal year's opening balance, e.g. --set-opening FY27 1234.56")
     parser.add_argument('--source', help='Where the --set-opening figure comes from (required with it)')
+    parser.add_argument('--email-latest', action='store_true',
+                        help="Email the newest report's summary now, even if it was already emailed")
     args = parser.parse_args()
 
     opening = None
@@ -347,6 +588,7 @@ def main() -> int:
         return 1
 
     failures = 0
+    gmail = None
     try:
         check_tables(conn.cursor())
         if opening:
@@ -354,18 +596,23 @@ def main() -> int:
         elif args.import_file:
             failures += import_file(conn, args.import_file)
         elif gmail_mode:
+            gmail = GmailClient.from_env()
             query = os.getenv('QBO_REPORT_QUERY') or DEFAULT_GMAIL_QUERY
-            failures += import_from_gmail(conn, GmailClient.from_env(), query, args.dry_run)
+            failures += import_from_gmail(conn, gmail, query, args.dry_run)
 
-        ok, stale = report_balance(conn)
+        ok, stale, summary = report_balance(conn)
         if not ok:
             failures += 1
+        if not args.dry_run:
+            conn.commit()
+        if args.email_latest and not gmail:
+            gmail = GmailClient.from_env()
+        if gmail:
+            failures += email_new_report(conn, gmail, summary, args.dry_run, force=args.email_latest)
 
         if args.dry_run:
             conn.rollback()
             logging.info("Dry run - all database writes rolled back")
-        else:
-            conn.commit()
     except (SetupError, GmailAuthError) as e:
         conn.rollback()
         logging.error(str(e))

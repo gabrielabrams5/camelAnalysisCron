@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 One-time helper: mint the Gmail refresh token that finance/track_balance.py
-(pipeline Step 9) uses to read the weekly QuickBooks P&L email.
+(pipeline Step 9) uses to read the weekly QuickBooks P&L email and to send
+the balance summary.
 
 Run it locally and approve in the browser while signed in to the mailbox that
-receives the QuickBooks reports. The scope is read-only (gmail.readonly).
+receives the QuickBooks reports. Scopes: gmail.readonly and gmail.send (it can
+read mail and send as you; it cannot delete, change or label anything).
+Re-run it whenever the scopes change; the old token keeps only the old ones.
 
 Setup:
 1. Google Cloud console -> the project that holds camelManagement's Gmail
@@ -36,7 +39,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv, set_key
 
-from gmail_client import API_BASE, SCOPE, TOKEN_URL
+from gmail_client import API_BASE, SCOPES, TOKEN_URL
 
 AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 ENV_PATH = Path(__file__).resolve().parent.parent / '.env'
@@ -103,7 +106,7 @@ def main():
         'client_id': client_id,
         'redirect_uri': redirect_uri,
         'response_type': 'code',
-        'scope': SCOPE,
+        'scope': ' '.join(SCOPES),
         'access_type': 'offline',
         'prompt': 'consent',  # always issue a refresh token, even on re-authorization
         'state': state,
@@ -140,7 +143,7 @@ def main():
     mailbox = profile.json().get('emailAddress', '?') if profile.ok else '?'
 
     set_key(str(ENV_PATH), 'GMAIL_REFRESH_TOKEN', tokens['refresh_token'])
-    print(f"Authorized read-only access to {mailbox}.")
+    print(f"Authorized reading {mailbox} and sending the balance summary from it.")
     print(f"GMAIL_REFRESH_TOKEN saved to {ENV_PATH}.")
     print("Now copy GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN to Railway's Variables.")
 

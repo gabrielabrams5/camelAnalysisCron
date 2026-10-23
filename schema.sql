@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS camel_fiscal_years (
 -- manually imported workbook (source_id = 'file:<sha256>'). 'imported' rows
 -- hold a weekly P&L's fiscal-year-to-date totals and per-account figures;
 -- 'skipped' rows are other QuickBooks attachments, kept so they are not
--- fetched again. Written by finance/track_balance.py (pipeline Step 9).
+-- fetched again. emailed_at is set once a report is covered by the weekly
+-- summary email. Written by finance/track_balance.py (pipeline Step 9).
 
 CREATE TABLE IF NOT EXISTS camel_pl_reports (
     id SERIAL PRIMARY KEY,
@@ -113,6 +114,7 @@ CREATE TABLE IF NOT EXISTS camel_pl_reports (
     net_income NUMERIC(12,2),
     accounts JSONB,
     imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    emailed_at TIMESTAMPTZ,
     CHECK (status IN ('imported', 'skipped')),
     CHECK (status = 'skipped' OR (as_of_date IS NOT NULL
                                   AND fiscal_year IS NOT NULL

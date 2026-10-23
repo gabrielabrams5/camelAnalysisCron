@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Minimal read-only Gmail API client (plain requests, no Google SDK).
+Minimal Gmail API client (plain requests, no Google SDK): reads mail, and
+sends the weekly balance summary from the same mailbox.
 
 Authenticates with a long-lived OAuth refresh token minted once by
 finance/gmail_auth.py, and exchanges it for a short-lived access token per run.
@@ -14,13 +15,18 @@ Environment variables:
 import base64
 import os
 import time
+from email.message import EmailMessage
 from typing import Iterator, List, Optional, Tuple
 
 import requests
 
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
 API_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me'
-SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
+# Read the QuickBooks reports; send the weekly summary. Nothing else.
+SCOPES = (
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.send',
+)
 
 
 class GmailAuthError(RuntimeError):
@@ -91,6 +97,28 @@ class GmailClient:
 
     def get_message(self, message_id: str) -> dict:
         return self._get(f'/messages/{message_id}', {'format': 'full'})
+
+    def mailbox(self) -> str:
+        """The address this token belongs to."""
+        return self._get('/profile')['emailAddress']
+
+    def send(self, to: List[str], subject: str, text: str, html: Optional[str] = None) -> str:
+        """Send a message from this mailbox. Returns the sent message's id."""
+        msg = EmailMessage()
+        msg['To'] = ', '.join(to)
+        msg['Subject'] = subject
+        msg.set_content(text)
+        if html:
+            msg.add_alternative(html, subtype='html')
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        resp = requests.post(API_BASE + '/messages/send', json={'raw': raw}, timeout=self.timeout,
+                             headers={'Authorization': f'Bearer {self._token()}'})
+        if resp.status_code == 403 and 'scope' in resp.text.lower():
+            raise GmailAuthError(
+                "GMAIL_REFRESH_TOKEN cannot send mail - it was minted before sending was added. "
+                "Re-run finance/gmail_auth.py and update GMAIL_REFRESH_TOKEN in Railway")
+        resp.raise_for_status()
+        return resp.json().get('id', '')
 
     def attachments(self, message: dict) -> Iterator[Tuple[str, bytes]]:
         """Yield (filename, content) for every attachment of a full-format message."""

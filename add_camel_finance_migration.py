@@ -14,6 +14,12 @@ This migration adds:
   QuickBooks attachments are recorded as 'skipped' so they are not re-fetched.
 - camel_balance_history (view): the balance after every imported report
   = opening balance of its fiscal year + net income so far that year.
+- camel_pl_reports.emailed_at (added 2026-10-23): set once a report has been
+  covered by the weekly summary email, so each new report is emailed once and
+  a failed send is retried. Existing reports are left NULL, so the first run
+  after this emails the newest one.
+
+Safe to re-run: every statement is IF NOT EXISTS / OR REPLACE.
 
 No amounts are seeded here - this repo is public. After running it, record the
 FY27 opening ("Beginning Balance") from Hillel's roll-forward report:
@@ -87,6 +93,10 @@ def run_migration():
             CREATE INDEX IF NOT EXISTS idx_camel_pl_reports_as_of
             ON camel_pl_reports (fiscal_year, as_of_date);
         """)
+        cur.execute("""
+            ALTER TABLE camel_pl_reports
+            ADD COLUMN IF NOT EXISTS emailed_at TIMESTAMPTZ;
+        """)
 
         print("  - Creating camel_balance_history view...")
         cur.execute("""
@@ -112,9 +122,13 @@ def run_migration():
         cur.execute("""
             SELECT to_regclass('public.camel_fiscal_years'),
                    to_regclass('public.camel_pl_reports'),
-                   to_regclass('public.camel_balance_history');
+                   to_regclass('public.camel_balance_history'),
+                   (SELECT count(*) FROM information_schema.columns
+                    WHERE table_name = 'camel_pl_reports' AND column_name = 'emailed_at');
         """)
-        print(f"\nVerification: {', '.join(str(t) for t in cur.fetchone())}")
+        fiscal_years, reports, view, emailed_at = cur.fetchone()
+        print(f"\nVerification: {fiscal_years}, {reports}, {view}, "
+              f"emailed_at column {'present' if emailed_at else 'MISSING'}")
 
     except psycopg2.Error as e:
         print(f"✗ Migration failed: {e}")
