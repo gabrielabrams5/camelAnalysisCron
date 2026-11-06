@@ -95,8 +95,10 @@ CREATE TABLE IF NOT EXISTS camel_fiscal_years (
 -- One row per QuickBooks report email (source_id = Gmail message id) or
 -- manually imported workbook (source_id = 'file:<sha256>'). 'imported' rows
 -- hold a weekly P&L's fiscal-year-to-date totals and per-account figures;
--- 'skipped' rows are other QuickBooks attachments, kept so they are not
--- fetched again. emailed_at is set once a report is covered by the weekly
+-- 'ledger' rows are Transaction Detail reports covering period_start -
+-- as_of_date, whose lines are in camel_transactions (generated_at: when
+-- QuickBooks ran it); 'skipped' rows are other attachments, kept so they are
+-- not fetched again. emailed_at is set once a report is covered by the weekly
 -- summary email. Written by finance/track_balance.py (pipeline Step 9).
 
 CREATE TABLE IF NOT EXISTS camel_pl_reports (
@@ -115,13 +117,101 @@ CREATE TABLE IF NOT EXISTS camel_pl_reports (
     accounts JSONB,
     imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     emailed_at TIMESTAMPTZ,
-    CHECK (status IN ('imported', 'skipped')),
-    CHECK (status = 'skipped' OR (as_of_date IS NOT NULL
-                                  AND fiscal_year IS NOT NULL
-                                  AND net_income IS NOT NULL))
+    generated_at TIMESTAMPTZ,
+    CONSTRAINT camel_pl_reports_status_check
+        CHECK (status IN ('imported', 'skipped', 'ledger')),
+    CONSTRAINT camel_pl_reports_imported_check
+        CHECK (status <> 'imported' OR (as_of_date IS NOT NULL
+                                        AND fiscal_year IS NOT NULL
+                                        AND net_income IS NOT NULL)),
+    CONSTRAINT camel_pl_reports_ledger_check
+        CHECK (status <> 'ledger' OR (period_start IS NOT NULL
+                                      AND as_of_date IS NOT NULL))
 );
 
 CREATE INDEX idx_camel_pl_reports_as_of ON public.camel_pl_reports USING btree (fiscal_year, as_of_date);
+
+
+-- ============================================
+-- TABLE: camel_transactions
+-- ============================================
+-- Every line of every 'ledger' report: QuickBooks' weekly / YTD Transaction
+-- Detail, Hillel's roll-forward detail, and camelManagement's pre-July-2025
+-- expenses (category set, account NULL). section is 'income', 'expense' or
+-- 'balance' (balance-sheet accounts such as prepaid expenses). Created by
+-- add_camel_transactions_migration.py.
+
+CREATE TABLE IF NOT EXISTS camel_transactions (
+    id SERIAL PRIMARY KEY,
+    report_id INTEGER NOT NULL REFERENCES camel_pl_reports(id) ON DELETE CASCADE,
+    line_no INTEGER NOT NULL,
+    txn_date DATE NOT NULL,
+    account TEXT,
+    section VARCHAR(10) NOT NULL,
+    txn_type TEXT,
+    num TEXT,
+    name TEXT,
+    description TEXT,
+    amount NUMERIC(12,2) NOT NULL,
+    ap_paid TEXT,
+    category TEXT,
+    UNIQUE (report_id, line_no),
+    CHECK (section IN ('income', 'expense', 'balance'))
+);
+
+CREATE INDEX idx_camel_transactions_date ON public.camel_transactions USING btree (txn_date);
+
+
+-- ============================================
+-- VIEW: camel_ledger
+-- ============================================
+-- The current ledger: each line comes from the newest 'ledger' report covering
+-- its date (a report restates its whole period). Reports with no balance-sheet
+-- lines (Hillel's roll-forward lists P&L accounts only) do not override those.
+
+CREATE OR REPLACE VIEW camel_ledger AS
+SELECT
+    t.txn_date,
+    CASE WHEN EXTRACT(MONTH FROM t.txn_date) >= 7
+         THEN EXTRACT(YEAR FROM t.txn_date)::int + 1
+         ELSE EXTRACT(YEAR FROM t.txn_date)::int END AS fiscal_year,
+    t.section, t.account, t.category, t.txn_type, t.num, t.name, t.description,
+    t.amount, t.ap_paid, t.id, r.source_id
+FROM camel_transactions t
+JOIN camel_pl_reports r ON r.id = t.report_id
+WHERE t.report_id = (
+    SELECT newest.id FROM camel_pl_reports newest
+    WHERE newest.status = 'ledger'
+      AND t.txn_date BETWEEN newest.period_start AND newest.as_of_date
+      AND (t.section <> 'balance' OR EXISTS (
+          SELECT 1 FROM camel_transactions b
+          WHERE b.report_id = newest.id AND b.section = 'balance'))
+    ORDER BY newest.generated_at DESC NULLS LAST, newest.received_at DESC NULLS LAST, newest.id DESC
+    LIMIT 1
+);
+
+
+-- ============================================
+-- TABLE: camel_pledges
+-- ============================================
+-- Donations logged in camelManagement (status verbal / unconfirmed /
+-- confirmed / not_received), copied by finance/import_camel_management.py.
+
+CREATE TABLE IF NOT EXISTS camel_pledges (
+    id SERIAL PRIMARY KEY,
+    mgmt_id TEXT UNIQUE NOT NULL,
+    amount NUMERIC(12,2) NOT NULL,
+    pledged_at DATE NOT NULL,
+    expected_at DATE,
+    status VARCHAR(20) NOT NULL,
+    confirmed_at TIMESTAMPTZ,
+    campaign TEXT,
+    camelhack_edition SMALLINT,
+    donors TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ,
+    migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 
 -- ============================================

@@ -65,13 +65,18 @@ All files are saved to a persistent Railway volume for long-term storage.
 - The Sunday email is a snapshot: entries Hillel books later but dates earlier (deposits often lag a week) show up in the next week's report, so a balance can trail Hillel's own figure for the same date
 - **Fails the run** if no new P&L has arrived for 9+ days, since a stopped QuickBooks schedule otherwise looks like a quiet week
 - Opening balances live in `camel_fiscal_years` and are never committed (public repo). `camel_balance_history` is a view of the balance after every report
+- **Transaction ledger**: the Transaction Detail reports QuickBooks also sends (*"Camel Weekly Transaction Report"*, *"Camel YTD Transactions"*) are stored line by line in `camel_transactions` (`finance/transaction_report.py` parses them). The `camel_ledger` view is the current ledger: each date's lines come from the newest report covering it, so QuickBooks edits replace older reports. Hillel's roll-forward workbook (FY26 + FY27 detail) is imported the same way with `--import-file`, and camelManagement's FY25 history and logged pledges with `finance/import_camel_management.py`
+- Every run checks the ledger against the newest P&L account by account and warns where they differ: weekly reports only cover their own week, so an entry posted late but dated earlier reaches the P&L but no weekly report (ask Hillel for a YTD transaction report)
 - One-time setup:
   ```bash
   python3 add_camel_finance_migration.py
+  python3 add_camel_transactions_migration.py
   python3 finance/track_balance.py --set-opening FY27 <Beginning Balance from Hillel's roll-forward report> --source "Hillel roll-forward report as of 2026-10-18"
+  python3 finance/track_balance.py --import-file "<Hillel roll-forward workbook>.xlsx"   # FY26 + FY27 transactions
+  MGMT_DATABASE_URL=<camelManagement Postgres URL> python3 finance/import_camel_management.py
   python3 finance/gmail_auth.py   # mints GMAIL_REFRESH_TOKEN (read + send) into .env; see its docstring
   ```
-- Other commands: `--dry-run` (roll back all writes), `--no-gmail` (balance from stored reports only), `--import-file report.xlsx` (import a saved P&L workbook, e.g. a week the email was lost), `--no-gmail --email-latest` (re-send the newest summary)
+- Other commands: `--dry-run` (roll back all writes), `--no-gmail` (balance from stored reports only), `--import-file report.xlsx` (import a saved P&L or Transaction Detail workbook, e.g. a week the email was lost), `--no-gmail --email-latest` (re-send the newest summary)
 - The email covers: balance and its move since the last report, the fiscal year so far, what was received/spent/refunded since the last report, spending by category with shares, received/spent/net by month, the balance after each weekly report, and the average monthly spend with how long the balance lasts at that rate
 
 ## Pipeline Execution Flow

@@ -17,13 +17,17 @@ in the next week's report (each report restates the whole year); e.g. the
 contribution and two card charges posted after Sunday.
 
 Each run (Step 9 of run_luma_pipeline.sh):
-1. Searches Gmail - Trash included, since camelManagement bins the QuickBooks
-   transaction report it imports - for QuickBooks reports not seen before.
-   Each P&L's year-to-date totals and per-account figures go into
-   camel_pl_reports. Other QuickBooks attachments (the weekly transaction
-   report) are recorded as 'skipped' so they are not fetched again. A report
+1. Searches Gmail - Trash included, in case anyone bins the reports - for
+   QuickBooks reports not seen before. Each P&L's year-to-date totals and
+   per-account figures go into camel_pl_reports. Each Transaction Detail
+   report ("Camel Weekly Transaction Report", "Camel YTD Transactions") is
+   recorded there as 'ledger' and its lines go into camel_transactions; the
+   camel_ledger view keeps, for every date, the newest report covering it.
+   Anything else is recorded as 'skipped' so it is not fetched again. A report
    that fails to import is not recorded, so the next run retries it.
-2. Logs the current balance and what changed since the previous report.
+2. Logs the current balance and what changed since the previous report, and
+   warns where the ledger's per-account totals disagree with the newest P&L
+   (usually an entry posted late but dated in a week already reported).
 3. The first time a report is the newest one, emails that summary from the
    same Gmail account to BALANCE_EMAIL_TO (comma-separated; default: the
    mailbox itself; "none" turns it off). A failed send is retried next run.
@@ -39,13 +43,14 @@ Usage:
     python3 finance/track_balance.py                    # import new emails, log balance
     python3 finance/track_balance.py --dry-run          # same, roll back all writes
     python3 finance/track_balance.py --no-gmail         # log balance from stored reports
-    python3 finance/track_balance.py --import-file X.xlsx   # import a saved P&L workbook
+    python3 finance/track_balance.py --import-file X.xlsx   # import a saved P&L or transaction workbook
     python3 finance/track_balance.py --no-gmail --email-latest   # re-send the newest summary
     python3 finance/track_balance.py --set-opening FY27 <amount> --source "where it came from"
 
 Needs the PG* variables, and GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET /
 GMAIL_REFRESH_TOKEN for the Gmail search and the email (see finance/gmail_auth.py).
-Tables are created by add_camel_finance_migration.py.
+Tables are created by add_camel_finance_migration.py and
+add_camel_transactions_migration.py.
 """
 
 import argparse
@@ -66,6 +71,7 @@ from dotenv import load_dotenv
 
 from gmail_client import GmailAuthError, GmailClient, header
 from pl_report import fy_label, parse_pl_workbook
+from transaction_report import parse_transaction_workbook
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,6 +114,9 @@ def check_tables(cur):
     if not cur.fetchone():
         raise SetupError("camel_pl_reports.emailed_at does not exist - "
                          "re-run add_camel_finance_migration.py")
+    cur.execute("SELECT to_regclass('public.camel_transactions')")
+    if cur.fetchone()[0] is None:
+        raise SetupError("camel_transactions does not exist - run add_camel_transactions_migration.py")
 
 
 def money(x: Decimal) -> str:
@@ -143,11 +152,46 @@ def store_report(cur, source_id, subject, received_at, filename, report):
           json.dumps(report.accounts)))
 
 
+def store_ledger(cur, source_id, subject, received_at, filename, report):
+    """A Transaction Detail report and its lines."""
+    cur.execute("""
+        INSERT INTO camel_pl_reports
+            (source_id, status, subject, received_at, filename, period_start, as_of_date, generated_at)
+        VALUES (%s, 'ledger', %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (source_id, subject, received_at, filename, report.period_start, report.as_of,
+          report.generated_at or received_at))
+    report_id = cur.fetchone()[0]
+    psycopg2.extras.execute_values(cur, """
+        INSERT INTO camel_transactions
+            (report_id, line_no, txn_date, account, section, txn_type, num, name, description,
+             amount, ap_paid)
+        VALUES %s
+    """, [(report_id, i, l.txn_date, l.account, l.section, l.txn_type, l.num, l.name, l.description,
+           l.amount, l.ap_paid) for i, l in enumerate(report.lines, 1)])
+
+
 def store_skipped(cur, source_id, subject, received_at, filenames):
     cur.execute("""
         INSERT INTO camel_pl_reports (source_id, status, subject, received_at, filename)
         VALUES (%s, 'skipped', %s, %s, %s)
     """, (source_id, subject, received_at, filenames))
+
+
+def parse_workbook(content: bytes):
+    """('pl', PLReport) or ('ledger', TransactionReport) or (None, None)."""
+    report = parse_pl_workbook(content)
+    if report:
+        return 'pl', report
+    report = parse_transaction_workbook(content)
+    if report:
+        return 'ledger', report
+    return None, None
+
+
+def describe_ledger(report) -> str:
+    return (f"transactions {report.period_start} - {report.as_of} "
+            f"({len(report.lines)} line{'s' if len(report.lines) != 1 else ''})")
 
 
 def import_from_gmail(conn, gmail: GmailClient, query: str, dry_run: bool) -> int:
@@ -167,22 +211,27 @@ def import_from_gmail(conn, gmail: GmailClient, query: str, dry_run: bool) -> in
             subject = header(message, 'Subject') or ''
             received_at = datetime.fromtimestamp(int(message['internalDate']) / 1000, tz=timezone.utc)
 
-            report, filename, names = None, None, []
+            kind, report, filename, names = None, None, None, []
             for name, content in gmail.attachments(message):
                 names.append(name)
                 if name.lower().endswith(('.xlsx', '.xlsm')):
-                    report = parse_pl_workbook(content)
+                    kind, report = parse_workbook(content)
                     if report:
                         filename = name
                         break
 
-            if report:
+            if kind == 'pl':
                 store_report(cur, message_id, subject, received_at, filename, report)
                 logging.info(f"  Imported {fy_label(report.fiscal_year)} P&L as of {report.as_of} "
                              f"({subject!r}, received {received_at:%Y-%m-%d})")
+            elif kind == 'ledger':
+                store_ledger(cur, message_id, subject, received_at, filename, report)
+                logging.info(f"  Imported {describe_ledger(report)} "
+                             f"({subject!r}, received {received_at:%Y-%m-%d})")
             else:
                 store_skipped(cur, message_id, subject, received_at, ', '.join(names) or None)
-                logging.info(f"  Skipped {subject!r} (received {received_at:%Y-%m-%d}): no P&L attached")
+                logging.info(f"  Skipped {subject!r} (received {received_at:%Y-%m-%d}): "
+                             f"no P&L or transaction report attached")
             cur.execute("RELEASE SAVEPOINT report")
             if not dry_run:
                 conn.commit()
@@ -203,9 +252,16 @@ def import_file(conn, path: str) -> int:
     if cur.fetchone():
         logging.info(f"{path} was already imported")
         return 0
+    # A workbook with transaction sheets is imported for those alone: Hillel's
+    # roll-forward workbook also carries a P&L, which the weekly email already has.
+    report = parse_transaction_workbook(content)
+    if report:
+        store_ledger(cur, source_id, f"manual import of {Path(path).name}", None, Path(path).name, report)
+        logging.info(f"Imported {describe_ledger(report)} from {path}")
+        return 0
     report = parse_pl_workbook(content)
     if report is None:
-        logging.error(f"{path} has no Statement of Activity sheet")
+        logging.error(f"{path} has no Statement of Activity or Transaction Detail sheet")
         return 1
     store_report(cur, source_id, f"manual import of {Path(path).name}", None, Path(path).name, report)
     logging.info(f"Imported {fy_label(report.fiscal_year)} P&L as of {report.as_of} from {path}")
@@ -328,6 +384,42 @@ def report_balance(conn):
         logging.warning(f"The newest P&L is {age} days old. QuickBooks should send one every Sunday "
                         f"('Camel P&L by Month updated weekly') - check the schedule with Hillel.")
     return True, stale, summary
+
+
+def check_ledger(conn, latest):
+    """
+    Warn where the transaction ledger's account totals disagree with the newest
+    P&L. Weekly transaction reports only cover their own week, so an entry
+    posted late but dated in an earlier week reaches the P&L but no weekly
+    report; this is how that shows up.
+    """
+    if not latest:
+        return
+    cur = conn.cursor()
+    cur.execute("SELECT max(as_of_date) FROM camel_pl_reports WHERE status = 'ledger'")
+    covered = cur.fetchone()[0]
+    if covered is None:
+        logging.info("No transaction reports imported yet - nothing to check the P&L against")
+        return
+    cur.execute("""
+        SELECT account, sum(amount) FROM camel_ledger
+        WHERE fiscal_year = %s AND txn_date <= %s AND section IN ('income', 'expense')
+        GROUP BY account
+    """, (latest['fiscal_year'], latest['as_of_date']))
+    ledger = dict(cur.fetchall())
+    pl = {a['account']: Decimal(str(a['total'])).quantize(Decimal('0.01')) for a in latest['accounts'] or []}
+    gaps = [(account, pl.get(account, Decimal('0')) - ledger.get(account, Decimal('0')))
+            for account in sorted(pl.keys() | ledger.keys())]
+    gaps = [(account, d) for account, d in gaps if d]
+    if not gaps:
+        logging.info(f"The transaction ledger agrees with the {day(latest['as_of_date'])} P&L, account by account")
+        return
+    logging.warning(f"The transaction ledger (reports through {day(covered)}) disagrees with the "
+                    f"{day(latest['as_of_date'])} P&L. P&L minus ledger:")
+    for account, d in gaps:
+        logging.warning(f"    {account:<45} {signed(d):>14}")
+    logging.warning("  Usually an entry posted after the weekly transaction report for its date; "
+                    "a fresh 'Camel YTD Transactions' report fills it in.")
 
 
 def summary_lines(s):
@@ -561,7 +653,8 @@ def main() -> int:
     parser.add_argument('--dry-run', action='store_true', help='Do everything but roll back all database writes')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--no-gmail', action='store_true', help='Only log the balance from stored reports')
-    mode.add_argument('--import-file', metavar='XLSX', help='Import a saved QuickBooks P&L workbook')
+    mode.add_argument('--import-file', metavar='XLSX',
+                      help='Import a saved QuickBooks P&L or Transaction Detail workbook')
     mode.add_argument('--set-opening', nargs=2, metavar=('FISCAL_YEAR', 'AMOUNT'),
                       help="Record a fiscal year's opening balance, e.g. --set-opening FY27 1234.56")
     parser.add_argument('--source', help='Where the --set-opening figure comes from (required with it)')
@@ -603,6 +696,7 @@ def main() -> int:
         ok, stale, summary = report_balance(conn)
         if not ok:
             failures += 1
+        check_ledger(conn, summary['latest'] if summary else None)
         if not args.dry_run:
             conn.commit()
         if args.email_latest and not gmail:
